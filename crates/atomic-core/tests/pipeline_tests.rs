@@ -997,15 +997,21 @@ async fn deferred_pipeline_leaves_jobs_in_ledger() {
         "deferred save must emit no pipeline events"
     );
 
-    // The parked job stays claimable: a worker (here: inline mode restored
-    // and the queue drained) runs it to completion.
-    core.set_inline_pipeline(true);
+    // The parked job stays claimable: a dedicated worker claims it and runs
+    // it to completion. `run_pipeline_jobs_batch` is the deferred-mode
+    // execution entry point, and — unlike `process_queued_pipeline_jobs` —
+    // it doesn't route through the process-global EMBEDDING_BATCH_SEMAPHORE.
+    // That semaphore (2 permits) is shared by every concurrently running
+    // test in this binary, and the spawning path returns 0 from its
+    // saturated branch (the work is handed to a parked waiter), so a
+    // synchronous claimed-count assertion through it flakes under parallel
+    // test execution.
     let (cb, mut rx) = event_collector();
-    let queued = core
-        .process_queued_pipeline_jobs(cb)
+    let claimed = core
+        .run_pipeline_jobs_batch(10, cb)
         .await
         .expect("drain queue");
-    assert_eq!(queued, 1, "the deferred job must still be claimable");
+    assert_eq!(claimed, 1, "the deferred job must still be claimable");
     await_pipeline(&mut rx, &atom_id).await;
 
     let fetched = core.get_atom(&atom_id).await.unwrap().expect("persisted");
