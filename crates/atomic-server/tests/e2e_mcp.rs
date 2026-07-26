@@ -8,7 +8,9 @@
 //!
 //! Deeper MCP protocol semantics (tool dispatch, session lifecycle,
 //! cancellation) belong in the rmcp crate's own suite; this file owns the
-//! "does our server expose MCP at all" contract.
+//! "does our server expose MCP at all" contract — plus the *tool surface*
+//! contract (names, titles, read-only/destructive annotations), which the
+//! docs and the connectors-directory listing depend on.
 
 mod support;
 
@@ -181,4 +183,162 @@ fn initialize_request() -> Value {
             "clientInfo": { "name": "atomic-e2e", "version": "0.0.0" }
         }
     })
+}
+
+/// Extract the JSON-RPC `result` object from a Streamable HTTP response body,
+/// which may be plain JSON or SSE-framed (`data: {...}` lines).
+fn extract_jsonrpc_result(content_type: &str, body: &str) -> Value {
+    let payloads: Vec<Value> = if content_type.starts_with("application/json") {
+        vec![serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("invalid JSON body: {e}\nbody = {body}"))]
+    } else {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .collect()
+    };
+    payloads
+        .into_iter()
+        .find_map(|v| v.get("result").cloned())
+        .unwrap_or_else(|| panic!("no JSON-RPC result in response; body = {body}"))
+}
+
+/// The tool surface is a public contract: the docs (README, manual guide) and
+/// the connectors-directory listing enumerate these names, and clients gate
+/// write confirmation on the annotations. Storage-independent, so SQLite only.
+#[actix_web::test]
+async fn mcp_tools_list_pins_tool_surface_sqlite() {
+    const READ_ONLY: &[&str] = &[
+        "semantic_search",
+        "read_atom",
+        "find_similar",
+        "list_tags",
+        "list_atoms",
+        "list_databases",
+        "list_wikis",
+        "get_wiki",
+        "list_reports",
+        "get_report_findings",
+        "search",
+        "fetch",
+    ];
+    const WRITE: &[&str] = &["create_atom", "ingest_url", "update_atom", "edit_atom"];
+
+    let Some(ctx) = TestCtx::new(Backend::Sqlite).await else {
+        return;
+    };
+    let server = spawn_live_server(&ctx).await;
+    let client = reqwest::Client::new();
+    let mcp_url = format!("{}/mcp", server.base_url);
+
+    let resp = client
+        .post(&mcp_url)
+        .bearer_auth(&ctx.token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&initialize_request())
+        .send()
+        .await
+        .expect("POST /mcp initialize");
+    assert!(resp.status().is_success(), "initialize: {}", resp.status());
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("initialize response carries Mcp-Session-Id")
+        .to_string();
+
+    let resp = client
+        .post(&mcp_url)
+        .bearer_auth(&ctx.token)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Session-Id", &session_id)
+        .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .send()
+        .await
+        .expect("POST /mcp initialized notification");
+    assert!(
+        resp.status().is_success(),
+        "initialized notification: {}",
+        resp.status()
+    );
+
+    let resp = client
+        .post(&mcp_url)
+        .bearer_auth(&ctx.token)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Session-Id", &session_id)
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+        .send()
+        .await
+        .expect("POST /mcp tools/list");
+    assert!(resp.status().is_success(), "tools/list: {}", resp.status());
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.text().await.expect("read tools/list body");
+    let result = extract_jsonrpc_result(&content_type, &body);
+
+    let tools = result
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools/list result carries a tools array");
+    let by_name: std::collections::HashMap<&str, &Value> = tools
+        .iter()
+        .map(|t| {
+            (
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .expect("tool has a name"),
+                t,
+            )
+        })
+        .collect();
+    assert_eq!(by_name.len(), tools.len(), "duplicate tool names");
+
+    for name in READ_ONLY.iter().chain(WRITE) {
+        let tool = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("tools/list missing {name}"));
+        let annotations = tool
+            .get("annotations")
+            .unwrap_or_else(|| panic!("{name} missing annotations"));
+        assert!(
+            annotations
+                .get("title")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| !t.is_empty()),
+            "{name} missing annotation title"
+        );
+    }
+    for name in READ_ONLY {
+        assert_eq!(
+            by_name[name]["annotations"]["readOnlyHint"],
+            json!(true),
+            "{name} should be annotated read-only"
+        );
+    }
+    for name in WRITE {
+        assert_eq!(
+            by_name[name]["annotations"]["readOnlyHint"],
+            json!(false),
+            "{name} should be annotated as a write tool"
+        );
+        assert!(
+            by_name[name]["annotations"]
+                .get("destructiveHint")
+                .is_some(),
+            "{name} must declare destructiveHint"
+        );
+    }
+    assert_eq!(
+        tools.len(),
+        READ_ONLY.len() + WRITE.len(),
+        "tool surface changed — update this test, the README tool list, and \
+         docs/manual/guides/mcp-server.md"
+    );
+
+    server.stop().await;
 }

@@ -13,7 +13,6 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing;
 
 const DEFAULT_PORT: u16 = 44380;
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -24,6 +23,26 @@ const TOKEN_FILE_NAME: &str = "local_server_token";
 /// Must match Tauri's `app.path().app_data_dir()` for identifier `com.atomic.app`.
 fn atomic_data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("com.atomic.app"))
+}
+
+/// Resolve the server's MCP endpoint. `ATOMIC_URL` (a full base URL such as
+/// `https://you.atomicapp.ai`) wins so the bridge can front remote HTTPS
+/// servers; otherwise compose the local-sidecar form from
+/// `ATOMIC_HOST`/`ATOMIC_PORT`.
+fn resolve_endpoint() -> String {
+    if let Ok(url) = env::var("ATOMIC_URL") {
+        let trimmed = url.trim_end_matches('/');
+        if trimmed.ends_with("/mcp") {
+            return trimmed.to_string();
+        }
+        return format!("{}/mcp", trimmed);
+    }
+    let port: u16 = env::var("ATOMIC_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let host = env::var("ATOMIC_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
+    format!("http://{}:{}/mcp", host, port)
 }
 
 /// Discover the auth token: ATOMIC_TOKEN env var, then local token file on disk.
@@ -273,14 +292,8 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    // Parse configuration from environment or args
-    let port: u16 = env::var("ATOMIC_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-
-    let host = env::var("ATOMIC_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    let endpoint = format!("http://{}:{}/mcp", host, port);
+    // Parse configuration from environment
+    let endpoint = resolve_endpoint();
 
     let auth_token = discover_token();
 
