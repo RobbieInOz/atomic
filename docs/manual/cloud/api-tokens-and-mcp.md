@@ -41,7 +41,7 @@ To pin the agent to one knowledge base, add the database id:
 https://<your-subdomain>.atomicapp.ai/mcp?db=<database-id>
 ```
 
-The MCP tools (semantic search, reading and writing atoms, URL ingestion) are advertised by the server, so new tools appear in your agent automatically as Atomic gains them. For the general MCP guide — including claude.ai custom connectors and the desktop stdio bridge — see [MCP Server](/guides/mcp-server/).
+The MCP tools — semantic search, atom reading and writing, URL ingestion, tag and database browsing, plus wiki articles and report findings — are advertised by the server, so new tools appear in your agent automatically as Atomic gains them. For the general MCP guide — including the claude.ai custom-connector walkthrough, Claude Code, Cursor, ChatGPT, and the desktop stdio bridge — see [MCP Server](/guides/mcp-server/).
 
 ## REST API
 

@@ -110,7 +110,7 @@ The current manual is intentionally small and several implemented features need 
 - WebSocket events: embedding/tagging pipeline, chat streaming/tool events, ingestion/feed events, queue progress, atom lifecycle events (including report findings flowing through `AtomCreated`), `DashboardFeaturedChanged`, and lag handling.
 - AI providers: OpenRouter, Ollama, and OpenAI-compatible providers, including model defaults, embedding dimensions, context length, connection tests, and re-embedding implications.
 - Browser extension configuration and real installation/build steps from `extension/`.
-- MCP remote OAuth/discovery behavior, Streamable HTTP endpoint details, bridge environment variables, and multi-database `db` query use.
+- MCP Streamable HTTP endpoint details (sessions, SSE framing) beyond the guide basics. Remote OAuth/discovery, bridge environment variables, per-client setup, and multi-database `db` query use are now covered in `manual/guides/mcp-server.md`.
 - Docker and reverse proxy production details: bind address, `PUBLIC_URL`, storage backend, persistent volumes, WebSocket forwarding, and token bootstrapping.
 - Capacitor mobile setup and capabilities as actually implemented in `mobile/ios/` and `mobile/android/`.
 

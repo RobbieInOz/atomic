@@ -158,7 +158,7 @@ Create a token from Settings > Connection > API Tokens, or via the CLI:
 atomic-server token create --name "claude"
 ```
 
-**Available tools:** `semantic_search`, `read_atom`, `create_atom`, `ingest_url`, `update_atom`
+**Available tools:** search and retrieval (`semantic_search`, `read_atom`, `find_similar`), browsing (`list_tags`, `list_atoms`, `list_databases`), synthesized knowledge (`list_wikis`, `get_wiki`, `list_reports`, `get_report_findings`), writing (`create_atom`, `ingest_url`, `update_atom`, `edit_atom`), and ChatGPT-compatible `search`/`fetch` aliases. See the [MCP Server guide](https://atomicapp.ai/manual/guides/mcp-server/) for per-client setup (claude.ai, Claude Code, Cursor, ChatGPT).
 
 ## Architecture
 
