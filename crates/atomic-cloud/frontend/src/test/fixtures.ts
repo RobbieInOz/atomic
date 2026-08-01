@@ -1,4 +1,28 @@
-import type { AccountOverview } from '../lib/api';
+import type { AccountOverview, ModelCatalogue } from '../lib/api';
+
+/**
+ * The provider status's model catalogue, shaped like the server's
+ * `byok_model_catalogue`. The embedding list is already width-filtered by the
+ * server, so the fixture carries only valid entries.
+ */
+export function modelCatalogue(patch: Partial<ModelCatalogue> = {}): ModelCatalogue {
+  return {
+    openrouter_embedding_models: [
+      { id: 'qwen/qwen3-embedding-8b', name: 'Qwen3 Embedding 8B', context_length: 32768 },
+      {
+        id: 'openai/text-embedding-3-small',
+        name: 'OpenAI: text-embedding-3-small',
+        context_length: 8192,
+      },
+    ],
+    embedding_dimension: 1536,
+    default_embedding_model: 'qwen/qwen3-embedding-8b',
+    default_llm_model: 'anthropic/claude-sonnet-5',
+    default_tagging_model: 'openai/gpt-5-nano',
+    suggested_llm_models: ['openai/gpt-5-mini', 'anthropic/claude-sonnet-5'],
+    ...patch,
+  };
+}
 
 /**
  * A ready account overview for tests, with sane defaults. Pass a partial to

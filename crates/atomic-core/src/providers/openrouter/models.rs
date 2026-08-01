@@ -30,7 +30,12 @@ pub struct OpenRouterEmbeddingModel {
 /// client-side (truncate + renormalize) for MRL models, so this value is the
 /// authoritative vector width the schema is created at. For MRL-capable models
 /// it may be smaller than the native maximum (e.g. Qwen3-Embedding-8B is native
-/// 4096 but we store 1024).
+/// 4096 but we store 1536).
+///
+/// **Ids are unique.** [`get_embedding_dimension`] resolves by first match, and
+/// the list is rendered verbatim into model pickers, so a duplicate id would
+/// both show the model twice and let a picker advertise a width the lookup
+/// disagrees with. Enforced by `ids_are_unique` below.
 pub const EMBEDDING_MODELS: &[OpenRouterEmbeddingModel] = &[
     // Qwen (default — top open-weight MTEB, cheapest, self-hostable).
     // Native 4096; we store 1536 (Matryoshka) to match the existing schema.
@@ -79,13 +84,7 @@ pub const EMBEDDING_MODELS: &[OpenRouterEmbeddingModel] = &[
         dimension: 1024,
         context_length: 8192,
     },
-    // Qwen
-    OpenRouterEmbeddingModel {
-        id: "qwen/qwen3-embedding-8b",
-        name: "Qwen: Qwen3 Embedding 8B",
-        dimension: 4096,
-        context_length: 32000,
-    },
+    // Qwen (the 8B entry lives at the top of the list — it is the default).
     OpenRouterEmbeddingModel {
         id: "qwen/qwen3-embedding-4b",
         name: "Qwen: Qwen3 Embedding 4B",
@@ -171,4 +170,40 @@ pub fn get_embedding_dimension(model_id: &str) -> Option<usize> {
         .iter()
         .find(|m| m.id == model_id)
         .map(|m| m.dimension)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A duplicate id is a silent trap: [`get_embedding_dimension`] resolves by
+    /// first match while [`get_embedding_models`] hands the whole list to model
+    /// pickers, so a second entry for the same id renders the model twice and
+    /// can advertise a width the lookup will never return. (This regressed
+    /// once: `qwen/qwen3-embedding-8b` was listed at both 1536 and 4096.)
+    #[test]
+    fn ids_are_unique() {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for model in EMBEDDING_MODELS {
+            if let Some(previous) = seen.insert(model.id, model.dimension) {
+                panic!(
+                    "duplicate embedding model id {:?} (dimensions {previous} and {}); \
+                     the lookup would resolve only the first",
+                    model.id, model.dimension
+                );
+            }
+        }
+    }
+
+    /// The default the rest of the stack assumes must be present at exactly the
+    /// width the vector schema is created at — a drift here would wedge every
+    /// deployment that never set an explicit model.
+    #[test]
+    fn default_model_is_registered_at_the_default_dimension() {
+        assert_eq!(
+            get_embedding_dimension(crate::providers::DEFAULT_EMBEDDING_MODEL),
+            Some(crate::providers::DEFAULT_EMBEDDING_DIMENSION),
+        );
+    }
 }

@@ -303,6 +303,43 @@ export interface ProviderStatus {
   /** Managed-key allowance usage, best-effort; `null` for BYOK or on lookup
    * failure. */
   usage: ManagedUsage | null;
+  /** The static model catalogue driving the BYOK pickers. Always present. */
+  catalogue: ModelCatalogue;
+}
+
+/** A curated OpenRouter embedding model the cloud will accept. */
+export interface CatalogueEmbeddingModel {
+  id: string;
+  name: string;
+  context_length: number;
+}
+
+/**
+ * The model catalogue served on the provider status (server:
+ * `byok_model_catalogue`). Served rather than mirrored so model ids live in
+ * exactly one place — contrast the managed lists in `./models`, which are still
+ * hand-mirrored constants.
+ */
+export interface ModelCatalogue {
+  /**
+   * Curated OpenRouter embedding models, **pre-filtered to
+   * `embedding_dimension`** — every entry is a valid choice, so the picker
+   * cannot offer a model the server would reject. Not applicable to
+   * OpenAI-compatible endpoints, which name their own models.
+   */
+  openrouter_embedding_models: CatalogueEmbeddingModel[];
+  /** The platform's pinned vector width; any other width is rejected. */
+  embedding_dimension: number;
+  /**
+   * What applies when the corresponding field is left blank. These are
+   * OpenRouter's defaults — an OpenAI-compatible endpoint has none, which is
+   * why the form requires its model fields.
+   */
+  default_embedding_model: string;
+  default_llm_model: string;
+  default_tagging_model: string;
+  /** Suggestions only — BYOK model choice is deliberately uncurated. */
+  suggested_llm_models: string[];
 }
 
 /** Managed-key allowance usage from the provisioning API. */

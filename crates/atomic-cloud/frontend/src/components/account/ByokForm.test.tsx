@@ -4,6 +4,9 @@ import userEvent from '@testing-library/user-event';
 import { ByokForm } from './ByokForm';
 import * as apiModule from '../../lib/api';
 import { ApiError } from '../../lib/api';
+import { modelCatalogue } from '../../test/fixtures';
+
+const catalogue = modelCatalogue();
 
 describe('ByokForm', () => {
   beforeEach(() => {
@@ -12,7 +15,7 @@ describe('ByokForm', () => {
 
   it('disables submit until the form is minimally valid', async () => {
     const user = userEvent.setup();
-    render(<ByokForm hasExistingKey={false} onSaved={() => {}} />);
+    render(<ByokForm hasExistingKey={false} catalogue={catalogue} onSaved={() => {}} />);
 
     const submit = screen.getByRole('button', { name: /save & validate/i });
     // No key yet → disabled.
@@ -23,9 +26,9 @@ describe('ByokForm', () => {
     expect(submit).toBeEnabled();
   });
 
-  it('requires a base URL for the OpenAI-compatible provider', async () => {
+  it('requires a base URL and both models for the OpenAI-compatible provider', async () => {
     const user = userEvent.setup();
-    render(<ByokForm hasExistingKey={false} onSaved={() => {}} />);
+    render(<ByokForm hasExistingKey={false} catalogue={catalogue} onSaved={() => {}} />);
 
     // Switch to OpenAI-compatible (a radio in the segmented control).
     await user.click(screen.getByRole('radio', { name: /openai-compatible/i }));
@@ -36,7 +39,70 @@ describe('ByokForm', () => {
     expect(submit).toBeDisabled();
 
     await user.type(screen.getByLabelText(/base url/i), 'https://endpoint.example/v1');
+    // Still not enough: this provider has NO default model ids, so blank
+    // fields would send an empty model id and come back as an opaque
+    // "the provider rejected the request".
+    expect(submit).toBeDisabled();
+
+    await user.type(screen.getByLabelText(/embedding model/i), 'text-embedding-3-small');
+    expect(submit).toBeDisabled();
+
+    await user.type(screen.getByLabelText(/llm model/i), 'local-llama');
     expect(submit).toBeEnabled();
+  });
+
+  it('names the real default in the OpenRouter embedding picker', () => {
+    // Regression: the field used to be free text with a hardcoded placeholder
+    // that had drifted from the actual fallback, suggesting a model that would
+    // have silently put new vectors in a different space from existing ones.
+    render(<ByokForm hasExistingKey={false} catalogue={catalogue} onSaved={() => {}} />);
+
+    const picker = screen.getByLabelText(/embedding model/i) as HTMLSelectElement;
+    // Blank (the default) is selected, and the option says which model that is.
+    expect(picker.value).toBe('');
+    expect(picker.selectedOptions[0].textContent).toContain('Qwen3 Embedding 8B');
+    // The LLM placeholder names its real fallback too.
+    expect(screen.getByLabelText(/llm model/i)).toHaveAttribute(
+      'placeholder',
+      catalogue.default_llm_model,
+    );
+  });
+
+  it('clears model fields when the provider changes', async () => {
+    const user = userEvent.setup();
+    render(<ByokForm hasExistingKey={false} catalogue={catalogue} onSaved={() => {}} />);
+
+    // Pick a non-default OpenRouter embedding model, then switch providers.
+    await user.selectOptions(
+      screen.getByLabelText(/embedding model/i),
+      'openai/text-embedding-3-small',
+    );
+    await user.type(screen.getByLabelText(/llm model/i), 'openai/gpt-5-mini');
+    await user.click(screen.getByRole('radio', { name: /openai-compatible/i }));
+
+    // Model ids are provider-namespaced: carrying them across would submit an
+    // OpenRouter id to an OpenAI-compatible endpoint.
+    expect((screen.getByLabelText(/embedding model/i) as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText(/llm model/i) as HTMLInputElement).value).toBe('');
+  });
+
+  it('omits blank model fields from the saved config', async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(apiModule, 'saveByokProvider').mockResolvedValue({
+      status: 'saved',
+      provider: 'openrouter',
+      origin: 'user',
+      reembed_warning: null,
+    });
+    render(<ByokForm hasExistingKey={false} catalogue={catalogue} onSaved={() => {}} />);
+
+    await user.type(screen.getByLabelText(/api key/i), 'sk-or-test');
+    await user.click(screen.getByRole('button', { name: /save & validate/i }));
+
+    // Leaving the pickers alone must send an empty config — the server then
+    // applies atomic-core's defaults, rather than us pinning a guess.
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0][0].model_config).toEqual({});
   });
 
   it('surfaces the server validation error verbatim and stores nothing', async () => {
@@ -48,7 +114,7 @@ describe('ByokForm', () => {
         new ApiError(400, 'provider_validation_failed', providerMessage),
       );
     const onSaved = vi.fn();
-    render(<ByokForm hasExistingKey={false} onSaved={onSaved} />);
+    render(<ByokForm hasExistingKey={false} catalogue={catalogue} onSaved={onSaved} />);
 
     await user.type(screen.getByLabelText(/api key/i), 'sk-or-bad');
     await user.click(screen.getByRole('button', { name: /save & validate/i }));
@@ -70,7 +136,7 @@ describe('ByokForm', () => {
       origin: 'user',
       reembed_warning: null,
     });
-    render(<ByokForm hasExistingKey onSaved={() => {}} />);
+    render(<ByokForm hasExistingKey catalogue={catalogue} onSaved={() => {}} />);
 
     const keyInput = screen.getByLabelText(/new api key/i) as HTMLInputElement;
     // The key field masks by default (never shows the secret as text).
@@ -98,7 +164,7 @@ describe('ByokForm', () => {
     });
     // The parent reloads status in place (it bumps a nonce — this same instance
     // stays mounted), so a save that left `submitting` set would brick the form.
-    render(<ByokForm hasExistingKey onSaved={() => {}} />);
+    render(<ByokForm hasExistingKey catalogue={catalogue} onSaved={() => {}} />);
 
     const submit = () => screen.getByRole('button', { name: /replace key|validating/i });
     await user.type(screen.getByLabelText(/new api key/i), 'sk-or-secret-value');

@@ -195,6 +195,7 @@ use std::time::Duration;
 
 use actix_web::middleware::from_fn;
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
+use atomic_core::providers::openrouter::models as openrouter_models;
 use atomic_core::providers::{create_embedding_provider, EmbeddingConfig, OpenRouterProvider};
 use atomic_core::{ProviderConfig, ProviderType};
 use serde::Deserialize;
@@ -206,6 +207,7 @@ use crate::billing::BillingProvider;
 use crate::control_plane::ControlPlane;
 use crate::curated_models::{
     merge_managed_model_config, validate_managed_model_config, PINNED_EMBEDDING_DIMENSION,
+    PRO_AGENTIC_MODELS,
 };
 use crate::error::CloudError;
 use crate::keyvault::{KeyVault, SecretKey};
@@ -865,10 +867,63 @@ async fn delete_account_route(
 
 // --- Provider settings routes (plan: "Provider management") ----------------
 
+/// The static model catalogue the BYOK picker renders from, carried on the
+/// provider status response (the one payload that form's page already loads,
+/// so the picker costs no extra round-trip).
+///
+/// Serving it — rather than mirroring it in the frontend — is deliberate. The
+/// managed lists in `frontend/src/lib/models.ts` are hand-mirrored constants
+/// with a documented drift risk; a sixteen-entry embedding registry is far
+/// worse to keep in lockstep by hand, and every value here already exists in
+/// exactly one authoritative place.
+///
+/// Two properties the form depends on:
+///
+/// - **The embedding list is filtered to [`PINNED_EMBEDDING_DIMENSION`].** A
+///   config at any other width is rejected before it is stored (the save and
+///   model routes both re-check it), so offering a wider model would be
+///   offering a guaranteed error. Filtering here turns a server-side rejection
+///   into a choice the user cannot make in the first place.
+/// - **`default_*` are the values that apply when the key is *omitted*** —
+///   atomic-core's provider defaults, the single source of default truth
+///   ([`build_provider_config`] starts from them). The form labels its
+///   "provider default" option with these, so a blank field is never
+///   mislabelled the way a hardcoded placeholder can drift into being.
+///
+/// The embedding registry is OpenRouter's, so the form applies it only to that
+/// provider; an OpenAI-compatible endpoint names its own models.
+fn byok_model_catalogue() -> Value {
+    let embedding_models: Vec<Value> = openrouter_models::get_embedding_models()
+        .iter()
+        .filter(|model| model.dimension == PINNED_EMBEDDING_DIMENSION)
+        .map(|model| {
+            json!({
+                "id": model.id,
+                "name": model.name,
+                "context_length": model.context_length,
+            })
+        })
+        .collect();
+    json!({
+        "openrouter_embedding_models": embedding_models,
+        "embedding_dimension": PINNED_EMBEDDING_DIMENSION,
+        "default_embedding_model": atomic_core::providers::DEFAULT_EMBEDDING_MODEL,
+        "default_llm_model": atomic_core::providers::DEFAULT_AGENTIC_MODEL,
+        "default_tagging_model": atomic_core::providers::DEFAULT_TAGGING_MODEL,
+        // Suggestions, not a whitelist: BYOK spends the user's own money, so
+        // the routes deliberately do not curate their model choice
+        // (`validate_byok_model_config` checks the key vocabulary, not model
+        // ids). The picker offers these and still accepts anything typed.
+        "suggested_llm_models": PRO_AGENTIC_MODELS,
+    })
+}
+
 /// `GET /api/account/provider`: status only — never the key, never a prefix
 /// (module docs). Managed usage is best-effort decoration: the lookup is
 /// capped at [`USAGE_TIMEOUT`] and any failure renders as `null`, never as
-/// an error response.
+/// an error response. The static [`byok_model_catalogue`] rides along on both
+/// branches — the form that needs it renders precisely when no provider is
+/// configured yet.
 async fn provider_status_route(req: HttpRequest, state: web::Data<PlaneState>) -> HttpResponse {
     let tenant = match require_account_scope(&req) {
         Ok(tenant) => tenant,
@@ -893,6 +948,7 @@ async fn provider_status_route(req: HttpRequest, state: web::Data<PlaneState>) -
             "last_validated_at": Value::Null,
             "last_validation_error": Value::Null,
             "usage": Value::Null,
+            "catalogue": byok_model_catalogue(),
         }));
     };
 
@@ -908,6 +964,7 @@ async fn provider_status_route(req: HttpRequest, state: web::Data<PlaneState>) -
         "last_validated_at": credentials.last_validated_at.map(|t| t.to_rfc3339()),
         "last_validation_error": credentials.last_validation_error,
         "usage": usage,
+        "catalogue": byok_model_catalogue(),
     }))
 }
 
@@ -1830,6 +1887,56 @@ fn deletion_busy() -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every embedding model the picker offers must be servable. The routes
+    /// reject any config whose effective width differs from the platform pin,
+    /// so an unfiltered entry would be an option that can only ever fail —
+    /// and the registry does carry wider models (3072, 2560, 1024, 768).
+    #[test]
+    fn catalogue_offers_only_pinned_width_embedding_models() {
+        let catalogue = byok_model_catalogue();
+        let offered = catalogue["openrouter_embedding_models"]
+            .as_array()
+            .expect("embedding models must be an array");
+        assert!(!offered.is_empty(), "the picker would have nothing to show");
+
+        for model in offered {
+            let id = model["id"].as_str().expect("every entry carries an id");
+            assert_eq!(
+                openrouter_models::get_embedding_dimension(id),
+                Some(PINNED_EMBEDDING_DIMENSION),
+                "offered model {id:?} cannot be served at the pinned width",
+            );
+        }
+        // And the filter is doing real work — the registry is wider than this.
+        assert!(
+            offered.len() < openrouter_models::get_embedding_models().len(),
+            "no model was filtered out; the pin check is vacuous",
+        );
+    }
+
+    /// The defaults the form labels its blank fields with must be the ones a
+    /// blank field actually resolves to. This is the exact drift that put a
+    /// stale `openai/text-embedding-3-small` hint in front of users while the
+    /// real fallback was Qwen — a wrong hint here invites a silent switch into
+    /// a different vector space, since both models are the same width.
+    #[test]
+    fn catalogue_defaults_match_what_an_empty_config_resolves_to() {
+        let catalogue = byok_model_catalogue();
+        let resolved = build_provider_config(Provider::OpenRouter, None, &json!({}));
+
+        assert_eq!(
+            catalogue["default_embedding_model"],
+            resolved.embedding_model()
+        );
+        assert_eq!(catalogue["default_llm_model"], resolved.agentic_model());
+        // The default embedding model must also be offered, or the picker's
+        // "Atomic's default" option could not name it.
+        assert_eq!(
+            openrouter_models::get_embedding_dimension(resolved.embedding_model()),
+            Some(PINNED_EMBEDDING_DIMENSION),
+        );
+    }
 
     /// The provider-write ordering guard: same-account acquisitions
     /// serialize, different accounts never contend, and the map prunes

@@ -240,6 +240,7 @@ function ProviderBody({
         <div className="mt-5">
           <ByokForm
             hasExistingKey={isByok}
+            catalogue={provider.catalogue}
             onSaved={(result) =>
               onWriteSucceeded(
                 result,
