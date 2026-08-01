@@ -149,7 +149,7 @@ async fn create_and_await(core: &AtomicCore, content: &str) -> String {
         .await
         .expect("create_atom")
         .expect("atom was inserted (not skipped)");
-    await_pipeline(&mut rx, &created.atom.id).await;
+    await_pipeline(core, &mut rx, &created.atom.id).await;
     created.atom.id
 }
 
@@ -668,7 +668,7 @@ async fn run_update_lifecycle(backend: Backend) {
     )
     .await
     .expect("update_atom");
-    await_pipeline(&mut rx, &a).await;
+    await_pipeline(core, &mut rx, &a).await;
     run_graph_maintenance(core).await;
 
     let a_after = core.get_atom(&a).await.unwrap().expect("a still exists");
@@ -743,7 +743,7 @@ async fn run_draft_save_then_finalize(backend: Backend) {
     core.process_atom_pipeline(&atom_id, cb)
         .await
         .expect("finalize pipeline");
-    await_pipeline(&mut rx, &atom_id).await;
+    await_pipeline(core, &mut rx, &atom_id).await;
 
     let finalized = core.get_atom(&atom_id).await.unwrap().expect("atom exists");
     assert_eq!(finalized.atom.embedding_status, "complete");
@@ -1012,7 +1012,7 @@ async fn deferred_pipeline_leaves_jobs_in_ledger() {
         .await
         .expect("drain queue");
     assert_eq!(claimed, 1, "the deferred job must still be claimable");
-    await_pipeline(&mut rx, &atom_id).await;
+    await_pipeline(core, &mut rx, &atom_id).await;
 
     let fetched = core.get_atom(&atom_id).await.unwrap().expect("persisted");
     assert_eq!(fetched.atom.embedding_status, "complete");
@@ -1021,4 +1021,64 @@ async fn deferred_pipeline_leaves_jobs_in_ledger() {
         0,
         "executed job must be cleared from the ledger"
     );
+}
+
+/// A save's own event sink is not guaranteed to observe that save's pipeline
+/// run. The ledger is per-storage but workers are spawned per-call and drain
+/// before releasing their permit, so a worker from an earlier save can claim
+/// this atom's job and emit into *its* sink; the originating call then claims
+/// an empty queue and drops its sender, closing the channel.
+///
+/// This test stages that interleaving deterministically — the saving call is
+/// given no worker at all (deferred mode), and an unrelated sink drains the
+/// job — and pins that `await_pipeline` rides it out via durable state
+/// instead of failing on the closed channel.
+///
+/// Production is unaffected either way: its sinks are process-wide (the
+/// server's broadcast channel, Tauri's `app_handle.emit`), so events reach
+/// clients regardless of which call's callback carried them. This flake was
+/// observed on main as `update_lifecycle_sqlite` (Jul 26).
+#[tokio::test]
+async fn await_pipeline_survives_a_run_claimed_by_another_worker() {
+    let mock = MockAiServer::start().await;
+    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+        .await
+        .expect("test harness setup");
+    let core = &handle.core;
+
+    // Deferred mode gives the save no worker of its own, so its callback is
+    // dropped on return — exactly what the stolen-run race leaves behind.
+    core.set_inline_pipeline(false);
+    let (cb, mut save_rx) = event_collector();
+    let created = core
+        .create_atom(
+            CreateAtomRequest {
+                content: "quantum mechanics is the study of particles and waves".to_string(),
+                ..Default::default()
+            },
+            cb,
+        )
+        .await
+        .expect("create_atom")
+        .expect("atom was inserted (not skipped)");
+    let atom_id = created.atom.id.clone();
+
+    // Another sink runs the job to completion — the "other worker".
+    let (other_cb, mut other_rx) = event_collector();
+    let claimed = core
+        .run_pipeline_jobs_batch(10, other_cb)
+        .await
+        .expect("drain queue");
+    assert_eq!(claimed, 1);
+    await_pipeline(core, &mut other_rx, &atom_id).await;
+
+    // The save's channel is closed and carried no events, yet the pipeline
+    // demonstrably completed. The awaiter must accept that rather than
+    // asserting a call-to-sink binding the architecture never promised.
+    assert!(
+        save_rx.try_recv().is_err(),
+        "the saving call's sink observed none of its own run"
+    );
+    let captured = await_pipeline(core, &mut save_rx, &atom_id).await;
+    assert!(captured.is_empty(), "no events could have arrived");
 }

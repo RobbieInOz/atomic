@@ -69,7 +69,7 @@ async fn create_and_await(core: &AtomicCore, content: &str) -> String {
         .await
         .expect("create_atom")
         .expect("atom inserted");
-    await_pipeline(&mut rx, &created.atom.id).await;
+    await_pipeline(core, &mut rx, &created.atom.id).await;
     created.atom.id
 }
 

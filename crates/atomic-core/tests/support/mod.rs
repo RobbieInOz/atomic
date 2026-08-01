@@ -226,7 +226,28 @@ pub fn event_collector() -> (
 /// (`TaggingComplete` / `TaggingSkipped` / `TaggingFailed`), and the owning
 /// queue run's completion have fired. Returns the captured target-atom events
 /// so tests can assert on payloads.
-pub async fn await_pipeline(rx: &mut EventRx, atom_id: &str) -> Vec<atomic_core::EmbeddingEvent> {
+///
+/// # Why this also watches durable state
+///
+/// A save's `on_event` sink is *not* guaranteed to observe that save's own
+/// pipeline events. The job ledger is per-storage while workers are spawned
+/// per-call, and a worker drains the ledger before releasing its permit — so
+/// a still-draining worker from an *earlier* save on the same core can claim
+/// this atom's job and emit into that earlier call's sink. The originating
+/// call then claims an empty queue, returns 0 without spawning, and drops the
+/// only sender this channel had.
+///
+/// Production never notices: every sink is process-wide (atomic-server's
+/// broadcast channel, Tauri's `app_handle.emit`), so the events reach clients
+/// either way. Only a per-call test channel can see the difference, and it
+/// sees it as a closed channel. Falling back to the durable record keeps the
+/// assertion honest — the work must still have completed — without asserting
+/// a 1:1 call-to-sink binding the architecture doesn't promise.
+pub async fn await_pipeline(
+    core: &AtomicCore,
+    rx: &mut EventRx,
+    atom_id: &str,
+) -> Vec<atomic_core::EmbeddingEvent> {
     use atomic_core::EmbeddingEvent;
 
     let mut captured = Vec::new();
@@ -249,7 +270,13 @@ pub async fn await_pipeline(rx: &mut EventRx, atom_id: &str) -> Vec<atomic_core:
 
         let ev = match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Some(ev)) => ev,
-            Ok(None) => panic!("event channel closed before pipeline finished"),
+            // Every sender is gone, so no further event can arrive on this
+            // channel — another worker owns the run (see the doc comment).
+            // Switch to the durable record for the rest of the budget.
+            Ok(None) => {
+                await_pipeline_via_storage(core, atom_id, deadline).await;
+                return captured;
+            }
             Err(_) => panic!(
                 "timed out waiting for pipeline events for {atom_id}. Captured: {:?}",
                 captured
@@ -291,4 +318,45 @@ pub async fn await_pipeline(rx: &mut EventRx, atom_id: &str) -> Vec<atomic_core:
     }
 
     captured
+}
+
+/// Poll the atom's durable pipeline status until both halves are terminal.
+///
+/// The fallback for [`await_pipeline`] when its event channel closes because
+/// another worker claimed the run. Asserts the same outcomes the event path
+/// does — embedding complete, tagging complete or deliberately skipped — and
+/// fails just as loudly on a recorded failure.
+async fn await_pipeline_via_storage(
+    core: &AtomicCore,
+    atom_id: &str,
+    deadline: tokio::time::Instant,
+) {
+    loop {
+        let atom = core
+            .get_atom(atom_id)
+            .await
+            .expect("read atom while awaiting pipeline")
+            .expect("atom exists while awaiting pipeline")
+            .atom;
+
+        match atom.embedding_status.as_str() {
+            "failed" => panic!("embedding failed for {atom_id} (recorded on the atom)"),
+            "complete" => match atom.tagging_status.as_str() {
+                "failed" => panic!("tagging failed for {atom_id} (recorded on the atom)"),
+                "complete" | "skipped" => return,
+                _ => {}
+            },
+            _ => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "pipeline did not complete for {atom_id} before the deadline (its event channel \
+                 closed, so another worker owned the run; last seen embedding_status={:?} \
+                 tagging_status={:?})",
+                atom.embedding_status, atom.tagging_status
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
