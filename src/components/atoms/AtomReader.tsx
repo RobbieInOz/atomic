@@ -14,6 +14,11 @@ import { formatDate } from '../../lib/date';
 import { getTransport, isDemoInstance } from '../../lib/transport';
 import { readerEditorActions } from '../../lib/reader-editor-bridge';
 import { atomLinkExtension, type AtomLinkSuggestion, type AtomLinkSuggestionSource } from '../../editor/atom-links';
+import { scrollToOffset, tocViewExtension } from '../../editor/toc-scroll';
+import { useTocItems, type TocItem } from '../toc/useTocItems';
+import { useCm6ScrollSpy } from '../toc/useCm6ScrollSpy';
+import { useTocPublisher } from '../toc/useTocPublisher';
+import type { EditorView } from '@codemirror/view';
 import type {
   AtomicCodeMirrorEditorHandle,
   AtomicCodeMirrorEditorProps,
@@ -185,7 +190,9 @@ function AtomReaderContent({
   const setReaderSaveStatus = useUIStore(s => s.setReaderSaveStatus);
   const retryTagging = useAtomsStore(s => s.retryTagging);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
   const editorHandleRef = useRef<AtomicCodeMirrorEditorHandle | null>(null);
+  const cmViewRef = useRef<EditorView | null>(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showTagSelector, setShowTagSelector] = useState(false);
@@ -388,15 +395,36 @@ function AtomReaderContent({
     };
   }, []);
 
-  const atomLinkExtensions = useMemo(
-    () => atomLinkExtension({
-      currentAtomId: atom.id,
-      suggestAtoms: suggestAtomLinks,
-      resolveAtom: resolveAtomLink,
-      openAtom: (id, opts) => onRelatedAtomClick(id, opts),
-    }),
+  // The editor reads `extensions` once per mount, so everything it needs has
+  // to arrive in this one array. `cmViewRef` is stable, and the editor is keyed
+  // on `${atom.id}:${editorRevision}`, so each remount re-captures its view.
+  const editorExtensions = useMemo(
+    () => [
+      atomLinkExtension({
+        currentAtomId: atom.id,
+        suggestAtoms: suggestAtomLinks,
+        resolveAtom: resolveAtomLink,
+        openAtom: (id, opts) => onRelatedAtomClick(id, opts),
+      }),
+      tocViewExtension(cmViewRef),
+    ],
     [atom.id, onRelatedAtomClick, resolveAtomLink, suggestAtomLinks],
   );
+
+  // Outline from the live draft, so a heading typed in edit mode shows up in
+  // the sidebar without waiting for a save.
+  const tocItems = useTocItems(editContent);
+  const activeTocId = useCm6ScrollSpy(scrollerRef, cmViewRef, tocItems);
+  const scrollToTocItem = useCallback((item: TocItem) => {
+    const view = cmViewRef.current;
+    if (view) scrollToOffset(view, item.offset);
+  }, []);
+  useTocPublisher({
+    source: 'atom',
+    items: tocItems,
+    activeId: activeTocId,
+    scrollToItem: scrollToTocItem,
+  });
 
   return (
     <div
@@ -412,7 +440,7 @@ function AtomReaderContent({
           the viewport may be wide while the reader is narrow — without
           container queries the desktop two-column would render at ~600px
           and squeeze the editor. */}
-      <div className="@container flex-1 overflow-y-auto scrollbar-auto-hide">
+      <div ref={scrollerRef} className="@container flex-1 overflow-y-auto scrollbar-auto-hide">
         <div className="max-w-6xl mx-auto px-3 py-5 sm:px-4 sm:py-6 @4xl:px-6 @4xl:flex @4xl:gap-10">
           <div className="flex-1 min-w-0">
             <Suspense fallback={null}>
@@ -428,7 +456,7 @@ function AtomReaderContent({
                   void openExternalUrl(url);
                 }}
                 editorHandleRef={editorHandleRef}
-                extensions={atomLinkExtensions}
+                extensions={editorExtensions}
               />
             </Suspense>
           </div>

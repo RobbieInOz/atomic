@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback, Fragment, ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Plus } from 'lucide-react';
-import { WikiArticle, WikiCitation, WikiLink, RelatedTag } from '../../stores/wiki';
+import type { Element } from 'hast';
+import { WikiCitation, WikiLink, RelatedTag } from '../../stores/wiki';
 import { CitationLink } from './CitationLink';
 import { CitationPopover } from './CitationPopover';
 import { WikiLinkInline } from './WikiLinkInline';
@@ -11,8 +12,16 @@ import { MarkdownImage } from '../ui/MarkdownImage';
 import { useContentSearch } from '../../hooks';
 import { formatRelativeTime } from '../../lib/date';
 
+/// Anchor for the article's own title. The body markdown is rendered with its
+/// leading `# Title` removed (see `stripArticleTitle` in WikiReader), so an
+/// outline entry for the title has to point at this rendered heading instead
+/// of at a source offset.
+export const WIKI_TITLE_ANCHOR_ID = '__top';
+
 interface WikiArticleContentProps {
-  article: WikiArticle;
+  /** The article body, exactly as it should render — the caller has already
+   *  stripped the leading title so heading offsets it parsed line up here. */
+  content: string;
   citations: WikiCitation[];
   wikiLinks: WikiLink[];
   relatedTags: RelatedTag[];
@@ -24,11 +33,20 @@ interface WikiArticleContentProps {
    *  article scrolls to / highlights that match on open. Used by the search
    *  palette to take a wiki hit straight to its specific occurrence. */
   highlightText?: string | null;
+  /** Ids to stamp on rendered headings, keyed by their offset in `content`.
+   *  Supplied by whoever owns the table of contents so its entries and the
+   *  DOM agree on names. */
+  headingIdByOffset?: Map<number, string>;
   onViewAtom: (atomId: string, highlightText?: string) => void;
   onNavigateToArticle: (tagId: string, tagName: string) => void;
 }
 
-export function WikiArticleContent({ article, citations, wikiLinks, relatedTags, tagName, updatedAt, sourceCount, titleActions, highlightText, onViewAtom, onNavigateToArticle }: WikiArticleContentProps) {
+interface HeadingProps {
+  node?: Element;
+  children?: ReactNode;
+}
+
+export function WikiArticleContent({ content, citations, wikiLinks, relatedTags, tagName, updatedAt, sourceCount, titleActions, highlightText, headingIdByOffset, onViewAtom, onNavigateToArticle }: WikiArticleContentProps) {
   const [activeCitation, setActiveCitation] = useState<WikiCitation | null>(null);
   const [anchorRect, setAnchorRect] = useState<{ top: number; left: number; bottom: number; width: number } | null>(null);
 
@@ -45,7 +63,7 @@ export function WikiArticleContent({ article, citations, wikiLinks, relatedTags,
     goToNext,
     goToPrevious,
     processChildren: highlightChildren,
-  } = useContentSearch(article.content);
+  } = useContentSearch(content);
 
   // Keyboard handler for Ctrl+F / Cmd+F
   useEffect(() => {
@@ -165,6 +183,14 @@ export function WikiArticleContent({ article, citations, wikiLinks, relatedTags,
     return children;
   }, [isSearchOpen, searchQuery, highlightChildren, wikiLinks, citations]);
 
+  // Heading ids come from the outline's own parse, matched by source offset.
+  // Re-slugging the rendered children here would drift from it on duplicate
+  // titles and on inline markup.
+  const headingId = (node?: Element): string | undefined => {
+    const offset = node?.position?.start?.offset;
+    return offset === undefined ? undefined : headingIdByOffset?.get(offset);
+  };
+
   // Custom components for react-markdown
   const components = {
     p: ({ children }: { children?: ReactNode }) => (
@@ -188,23 +214,23 @@ export function WikiArticleContent({ article, citations, wikiLinks, relatedTags,
     del: ({ children }: { children?: ReactNode }) => (
       <del>{processChildren(children)}</del>
     ),
-    h1: ({ children }: { children?: ReactNode }) => (
-      <h1>{processChildren(children)}</h1>
+    h1: ({ node, children }: HeadingProps) => (
+      <h1 id={headingId(node)}>{processChildren(children)}</h1>
     ),
-    h2: ({ children }: { children?: ReactNode }) => (
-      <h2>{processChildren(children)}</h2>
+    h2: ({ node, children }: HeadingProps) => (
+      <h2 id={headingId(node)}>{processChildren(children)}</h2>
     ),
-    h3: ({ children }: { children?: ReactNode }) => (
-      <h3>{processChildren(children)}</h3>
+    h3: ({ node, children }: HeadingProps) => (
+      <h3 id={headingId(node)}>{processChildren(children)}</h3>
     ),
-    h4: ({ children }: { children?: ReactNode }) => (
-      <h4>{processChildren(children)}</h4>
+    h4: ({ node, children }: HeadingProps) => (
+      <h4 id={headingId(node)}>{processChildren(children)}</h4>
     ),
-    h5: ({ children }: { children?: ReactNode }) => (
-      <h5>{processChildren(children)}</h5>
+    h5: ({ node, children }: HeadingProps) => (
+      <h5 id={headingId(node)}>{processChildren(children)}</h5>
     ),
-    h6: ({ children }: { children?: ReactNode }) => (
-      <h6>{processChildren(children)}</h6>
+    h6: ({ node, children }: HeadingProps) => (
+      <h6 id={headingId(node)}>{processChildren(children)}</h6>
     ),
     blockquote: ({ children }: { children?: ReactNode }) => (
       <blockquote>{processChildren(children)}</blockquote>
@@ -250,7 +276,7 @@ export function WikiArticleContent({ article, citations, wikiLinks, relatedTags,
           {/* Article title */}
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <h1 className="text-2xl font-bold text-[var(--color-text-primary)] mb-1">{tagName}</h1>
+              <h1 id={WIKI_TITLE_ANCHOR_ID} className="text-2xl font-bold text-[var(--color-text-primary)] mb-1">{tagName}</h1>
               <p className="text-xs text-[var(--color-text-secondary)]">
                 Updated {formatRelativeTime(updatedAt)} • {sourceCount} source{sourceCount !== 1 ? 's' : ''}
               </p>
@@ -265,7 +291,7 @@ export function WikiArticleContent({ article, citations, wikiLinks, relatedTags,
 
           <div className="prose prose-invert prose-headings:text-[var(--color-text-primary)] prose-h2:border-b prose-h2:border-[var(--color-border)] prose-h2:pb-1.5 prose-h2:mb-3 prose-p:text-[var(--color-text-primary)] prose-p:leading-relaxed prose-a:text-[var(--color-text-primary)] prose-a:underline prose-a:decoration-[var(--color-border-hover)] hover:prose-a:decoration-current prose-strong:text-[var(--color-text-primary)] prose-code:text-[var(--color-accent-light)] prose-code:bg-[var(--color-bg-card)] prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-[var(--color-bg-card)] prose-pre:border prose-pre:border-[var(--color-border)] prose-blockquote:border-l-[var(--color-accent)] prose-blockquote:text-[var(--color-text-secondary)] prose-li:text-[var(--color-text-primary)] prose-hr:border-[var(--color-border)]">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-              {article.content.replace(/^#\s+[^\n]+\n+/, '')}
+              {content}
             </ReactMarkdown>
           </div>
         </div>

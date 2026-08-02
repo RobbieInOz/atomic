@@ -205,6 +205,10 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
   error: null,
 
   fetchAllArticles: async () => {
+    // The wiki view and the sidebar's article list both load on mount and they
+    // mount together — collapse that pair into one round trip (the suggestion
+    // query it chains into is the expensive half).
+    if (get().isLoadingList) return;
     set({ isLoadingList: true, error: null });
     try {
       const articles = await getTransport().invoke<WikiArticleSummary[]>('get_all_wiki_articles');

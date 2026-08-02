@@ -4,7 +4,7 @@ import { MainView } from './MainView';
 import { LoadingIndicator } from '../ui/LoadingIndicator';
 import { ServerConnectionStatus } from '../ui/ServerConnectionStatus';
 import { RouterBridge } from '../../router/RouterBridge';
-import { SettingsModal } from '../settings/SettingsModal';
+import { SettingsModal, type SettingsTab } from '../settings/SettingsModal';
 import { OnboardingWizard } from '../onboarding';
 import { CommandPalette } from '../command-palette';
 import { SearchPalette } from '../search-palette/SearchPalette';
@@ -32,6 +32,7 @@ export function Layout() {
   const fetchTags = useTagsStore(s => s.fetchTags);
   const [isSetupRequired, setIsSetupRequired] = useState<boolean | null>(null); // null = checking
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>(undefined);
 
   // Command palette state
   const commandPaletteOpen = useUIStore((state) => state.commandPaletteOpen);
@@ -100,9 +101,14 @@ export function Layout() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [toggleCommandPalette, toggleSearchPalette, openSearchPalette, commandPaletteOpen, searchPaletteOpen]);
 
-  // Listen for custom settings event from command palette
+  // Listen for the app-wide settings event. Dispatchers may name a tab
+  // (`detail.tab`); those that don't — the command palette, the top-bar gear —
+  // leave the modal wherever the user last had it.
   useEffect(() => {
-    const handleOpenSettings = () => setSettingsOpen(true);
+    const handleOpenSettings = (e: Event) => {
+      setSettingsInitialTab((e as CustomEvent<{ tab?: SettingsTab } | undefined>).detail?.tab);
+      setSettingsOpen(true);
+    };
     window.addEventListener('open-settings', handleOpenSettings);
     return () => window.removeEventListener('open-settings', handleOpenSettings);
   }, []);
@@ -226,6 +232,7 @@ export function Layout() {
         <SettingsModal
           isOpen={settingsOpen}
           onClose={() => setSettingsOpen(false)}
+          initialTab={settingsInitialTab}
         />
       </div>
     </div>

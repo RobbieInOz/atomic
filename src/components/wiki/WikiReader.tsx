@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Clock, RefreshCw } from 'lucide-react';
 import { useWikiStore } from '../../stores/wiki';
 import { useUIStore } from '../../stores/ui';
-import { WikiArticleContent } from './WikiArticleContent';
+import { WikiArticleContent, WIKI_TITLE_ANCHOR_ID } from './WikiArticleContent';
 import { WikiEmptyState } from './WikiEmptyState';
 import { WikiGenerating } from './WikiGenerating';
 import { WikiProposalDiff } from './WikiProposalDiff';
+import { offsetWithinContainer, useDomScrollSpy } from '../toc/useDomScrollSpy';
+import { useTocItems, type TocItem } from '../toc/useTocItems';
+import { useTocPublisher } from '../toc/useTocPublisher';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
 import { formatRelativeTime } from '../../lib/date';
@@ -14,6 +17,17 @@ interface WikiReaderProps {
   tagId: string;
   tagName: string;
   highlightText?: string | null;
+}
+
+/** Space left above a heading scrolled to from the outline. */
+const SCROLL_TOP_MARGIN = 72;
+
+/// The generator opens every article with a `# Tag Name` line, which the
+/// reader already shows as page chrome. Strip it once here so the rendered
+/// body and the parsed outline see the exact same string — heading offsets
+/// only mean anything against the text react-markdown was handed.
+function stripArticleTitle(content: string): string {
+  return content.replace(/^#\s+[^\n]+\n+/, '');
 }
 
 export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
@@ -58,7 +72,52 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
   const [showRegenerateModal, setShowRegenerateModal] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
   const versionsRef = useRef<HTMLDivElement>(null);
+  const scrollerRef = useRef<HTMLDivElement>(null);
   const prevTagIdRef = useRef<string | null>(null);
+
+  // Table of contents. Computed above the loading/error/empty returns below so
+  // the hook order stays fixed; `scrollerRef` simply has nothing to measure
+  // until the article renders.
+  const displayContent = useMemo(
+    () => stripArticleTitle(selectedVersion?.content ?? currentArticle?.article.content ?? ''),
+    [selectedVersion, currentArticle],
+  );
+  // Nothing is typed here — the content only changes when another article
+  // loads — so re-parse on the next tick rather than holding the previous
+  // article's outline for the editor-oriented debounce.
+  const headings = useTocItems(displayContent, 0);
+  const headingIdByOffset = useMemo(
+    () => new Map(headings.map((heading) => [heading.offset, heading.id])),
+    [headings],
+  );
+  // The stripped title is still on screen as the page's own heading, so the
+  // outline opens with it — clicking it returns to the top of the article.
+  const tocItems = useMemo<TocItem[]>(
+    () => [
+      { id: WIKI_TITLE_ANCHOR_ID, depth: 1, text: tagName, offset: 0, line: 1 },
+      ...headings,
+    ],
+    [headings, tagName],
+  );
+  const activeTocId = useDomScrollSpy(scrollerRef, tocItems);
+  const scrollToTocItem = useCallback((item: TocItem) => {
+    const container = scrollerRef.current;
+    const el = container?.ownerDocument.getElementById(item.id);
+    if (!container || !el) return;
+    container.scrollTo({ top: offsetWithinContainer(container, el) - SCROLL_TOP_MARGIN });
+  }, []);
+  // Every other state below — loading, error, generating, no article yet, the
+  // proposal diff — renders something other than the article body, and an
+  // outline of a document that isn't on screen would only mislead.
+  const isArticleVisible =
+    !isLoading && !error && !isGenerating && !!currentArticle &&
+    !(reviewingProposal && proposal && !selectedVersion);
+  useTocPublisher({
+    source: isArticleVisible ? 'wiki' : null,
+    items: tocItems,
+    activeId: activeTocId,
+    scrollToItem: scrollToTocItem,
+  });
 
   // Fetch article data when tagId changes
   useEffect(() => {
@@ -150,9 +209,6 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
     );
   }
 
-  const displayArticle = selectedVersion
-    ? { content: selectedVersion.content, id: selectedVersion.id, tag_id: selectedVersion.tag_id, created_at: selectedVersion.created_at, updated_at: selectedVersion.created_at, atom_count: selectedVersion.atom_count }
-    : currentArticle.article;
   const displayCitations = selectedVersion
     ? selectedVersion.citations
     : currentArticle.citations;
@@ -208,9 +264,10 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
           isDismissing={isDismissing}
         />
       ) : (
-        <div className="flex-1 overflow-y-auto scrollbar-auto-hide">
+        <div ref={scrollerRef} className="flex-1 overflow-y-auto scrollbar-auto-hide">
           <WikiArticleContent
-            article={displayArticle}
+            content={displayContent}
+            headingIdByOffset={headingIdByOffset}
             citations={displayCitations}
             wikiLinks={selectedVersion ? [] : wikiLinks}
             relatedTags={selectedVersion ? [] : relatedTags}
