@@ -97,6 +97,10 @@ export interface ReportFindingWithAtom {
   atom: {
     id: string;
     content: string;
+    /// Server-derived plain-text first line (markdown stripped). Findings
+    /// open with their headline, so this is the row label everywhere a
+    /// finding is listed compactly.
+    title: string;
     source_url: string | null;
     created_at: string;
     updated_at: string;
@@ -331,6 +335,11 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
     hasSubscription: false,
 
     fetchAll: async () => {
+      // The reports view and the sidebar's findings panel both load on
+      // mount and they mount together — collapse that pair into one round
+      // trip (the per-report last-finding fan-out it chains into is the
+      // expensive half).
+      if (get().isLoadingList) return;
       set({ isLoadingList: true, loadError: null });
       try {
         const reports = await getTransport().invoke<Report[]>('list_reports');

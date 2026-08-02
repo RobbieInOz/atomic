@@ -103,7 +103,6 @@ interface UIStore {
   loadingOperations: LoadingOperation[];
   // Panel state
   leftPanelOpen: boolean;
-  wikiSidebarOpen: boolean;
   // Chat sidebar state
   chatSidebarOpen: boolean;
   chatSidebarWidth: number;
@@ -126,8 +125,6 @@ interface UIStore {
   setServerConnected: (connected: boolean) => void;
   setLeftPanelOpen: (open: boolean) => void;
   toggleLeftPanel: () => void;
-  setWikiSidebarOpen: (open: boolean) => void;
-  toggleWikiSidebar: () => void;
   setSelectedTag: (tagId: string | null) => void;
   expandTagPath: (tagIds: string[]) => void;
   toggleTagExpanded: (tagId: string) => void;
@@ -344,7 +341,6 @@ export const useUIStore = create<UIStore>()(
       },
       highlightedAtomId: null,
       leftPanelOpen: true,
-      wikiSidebarOpen: true,
       chatSidebarOpen: false,
       chatSidebarWidth: 480,
       chatSidebarConversationId: null,
@@ -359,8 +355,6 @@ export const useUIStore = create<UIStore>()(
 
       setLeftPanelOpen: (open: boolean) => set({ leftPanelOpen: open }),
       toggleLeftPanel: () => set((state) => ({ leftPanelOpen: !state.leftPanelOpen })),
-      setWikiSidebarOpen: (open: boolean) => set({ wikiSidebarOpen: open }),
-      toggleWikiSidebar: () => set((state) => ({ wikiSidebarOpen: !state.wikiSidebarOpen })),
       setServerConnected: (connected: boolean) => set({ serverConnected: connected }),
 
       setSelectedTag: (tagId: string | null) => {

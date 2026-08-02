@@ -62,7 +62,7 @@ export function DatabaseSwitcher() {
   }
 
   return (
-    <div className="relative flex-1 min-w-0" ref={dropdownRef}>
+    <div className="relative w-full min-w-0" ref={dropdownRef}>
       <button
         onClick={() => setIsOpen(!isOpen)}
         className="w-full flex items-center gap-1.5 px-2 py-1.5 text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] rounded transition-colors"

@@ -1,15 +1,69 @@
-import { useState, useRef, useEffect } from 'react';
-import { isDemoInstance } from '../../lib/transport';
+import { useRef, useEffect } from 'react';
 import { TagTree } from '../tags/TagTree';
-import { SettingsButton, SettingsModal, type SettingsTab } from '../settings';
-import { DatabaseSwitcher } from '../DatabaseSwitcher';
+import { TocPanel } from '../toc/TocPanel';
+import { WikiArticlesList } from '../wiki/WikiArticlesList';
+import { RecentAtomsPanel } from '../dashboard/RecentAtomsPanel';
+import { LatestFindingsPanel } from '../reports/LatestFindingsPanel';
 import { useUIStore } from '../../stores/ui';
+import { useTocStore, type TocSource } from '../../stores/toc';
 import { isTauri } from '../../lib/platform';
+import { SIDEBAR_CONTEXT_TITLES, useSidebarContext, type SidebarContext } from './sidebar-context';
 
 const COLLAPSE_BREAKPOINT = 768;
+
+const TOC_EMPTY_LABELS: Record<TocSource, string> = {
+  atom: 'No headings in this note',
+  wiki: 'No headings in this article',
+  finding: 'No headings in this finding',
+};
+
+/// The tag tree's empty state offers to configure tag categories. Layout owns
+/// the app's single SettingsModal, so ask for it by event rather than by prop.
+function openTagCategorySettings() {
+  window.dispatchEvent(new CustomEvent('open-settings', { detail: { tab: 'tag-categories' } }));
+}
+
+/// Table of contents for the reader that is currently mounted. The reader
+/// publishes its outline from an effect, one commit after the context flips,
+/// so until its publication lands render nothing — showing the previous
+/// document's headings, or a premature empty state, would both be wrong.
+function TocSidebar({ source }: { source: TocSource }) {
+  const publishedSource = useTocStore((s) => s.source);
+  const items = useTocStore((s) => s.items);
+  const activeId = useTocStore((s) => s.activeId);
+  const scrollToItem = useTocStore((s) => s.scrollToItem);
+
+  if (publishedSource !== source) return null;
+
+  return (
+    <TocPanel
+      items={items}
+      activeId={activeId}
+      onItemClick={scrollToItem}
+      emptyLabel={TOC_EMPTY_LABELS[source]}
+    />
+  );
+}
+
+/// Panel body for the current context. Swapping the body never touches the
+/// panel's open/closed state — that stays the user's manual toggle.
+function SidebarBody({ context }: { context: SidebarContext }) {
+  switch (context.kind) {
+    case 'tags':
+      return <TagTree onOpenTagSettings={openTagCategorySettings} />;
+    case 'toc':
+      return <TocSidebar source={context.source} />;
+    case 'wiki-list':
+      return <WikiArticlesList />;
+    case 'recent':
+      return <RecentAtomsPanel />;
+    case 'findings':
+      return <LatestFindingsPanel reportId={context.reportId} />;
+  }
+}
+
 export function LeftPanel() {
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>(undefined);
+  const context = useSidebarContext();
   const leftPanelOpen = useUIStore(s => s.leftPanelOpen);
   const setLeftPanelOpen = useUIStore(s => s.setLeftPanelOpen);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -69,30 +123,18 @@ export function LeftPanel() {
         <div
           className="h-full w-[250px] bg-[var(--color-bg-panel)]/80 border-r border-[var(--color-border)] backdrop-blur-xl flex flex-col overflow-hidden md:absolute md:inset-y-0 md:left-0 md:translate-x-0 md:pointer-events-auto"
         >
-          {/* Titlebar row with settings button */}
+          {/* Titlebar row — names whatever the body is currently showing */}
           <div className={`h-[52px] flex items-center px-3 flex-shrink-0 gap-1 ${isTauri() ? 'pl-[78px]' : ''}`} data-tauri-drag-region>
-            <DatabaseSwitcher />
-            {!isDemoInstance() && (
-              <SettingsButton onClick={() => { setSettingsInitialTab(undefined); setIsSettingsOpen(true); }} />
-            )}
+            <span className="text-xs font-semibold text-[var(--color-text-tertiary)] uppercase tracking-wider truncate select-none">
+              {SIDEBAR_CONTEXT_TITLES[context.kind]}
+            </span>
           </div>
 
-          {/* Tag Tree with integrated search */}
+          {/* Contextual body */}
           <div className="flex-1 overflow-hidden">
-            <TagTree
-              onOpenTagSettings={() => {
-                setSettingsInitialTab('tag-categories');
-                setIsSettingsOpen(true);
-              }}
-            />
+            <SidebarBody context={context} />
           </div>
         </div>
-
-        <SettingsModal
-          isOpen={isSettingsOpen}
-          onClose={() => setIsSettingsOpen(false)}
-          initialTab={settingsInitialTab}
-        />
       </aside>
     </>
   );

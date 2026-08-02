@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Telescope } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -13,7 +13,13 @@ import { useIsMobile } from '../../hooks';
 import { BriefingContent } from '../dashboard/widgets/BriefingContent';
 import { CitationPopover, CitationForPopover } from '../wiki/CitationPopover';
 import { SigmaCanvas } from '../canvas/SigmaCanvas';
+import { offsetWithinContainer, useDomScrollSpy } from '../toc/useDomScrollSpy';
+import { useTocItems, type TocItem } from '../toc/useTocItems';
+import { useTocPublisher } from '../toc/useTocPublisher';
 import { formatRelativeDate } from '../../lib/date';
+
+/** Space left above a heading scrolled to from the outline. */
+const SCROLL_TOP_MARGIN = 72;
 
 interface FindingReaderProps {
   atomId: string;
@@ -61,6 +67,7 @@ export function FindingReader({ atomId }: FindingReaderProps) {
   const setViewMode = useUIStore(s => s.setViewMode);
   const isMobile = useIsMobile();
 
+  const scrollerRef = useRef<HTMLDivElement>(null);
   const [loaded, setLoaded] = useState<LoadedFinding | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [activeCitation, setActiveCitation] = useState<CitationForPopover | null>(null);
@@ -132,6 +139,32 @@ export function FindingReader({ atomId }: FindingReaderProps) {
     atom_id: c.cited_atom_id,
     excerpt: c.excerpt,
   }));
+
+  // Table of contents, parsed from the raw finding markdown: BriefingContent
+  // demotes every heading to <h3>/<h4>, so true levels can only come from the
+  // source, and the ids it stamps are matched back by offset. Findings are
+  // read-only, so re-parse on the next tick rather than waiting out the
+  // editor-oriented debounce.
+  const headings = useTocItems(content, 0);
+  const headingIdByOffset = useMemo(
+    () => new Map(headings.map((heading) => [heading.offset, heading.id])),
+    [headings],
+  );
+  const activeTocId = useDomScrollSpy(scrollerRef, headings);
+  const scrollToTocItem = useCallback((item: TocItem) => {
+    const container = scrollerRef.current;
+    const el = container?.ownerDocument.getElementById(item.id);
+    if (!container || !el) return;
+    container.scrollTo({ top: offsetWithinContainer(container, el) - SCROLL_TOP_MARGIN });
+  }, []);
+  useTocPublisher({
+    // Nothing to outline until the finding's prose is on screen — before that
+    // the body is a skeleton or an unavailable notice.
+    source: loaded ? 'finding' : null,
+    items: headings,
+    activeId: activeTocId,
+    scrollToItem: scrollToTocItem,
+  });
 
   // Atom ids the mini-canvas scopes to: every distinct atom cited by
   // this finding. The canvas adds 1-hop neighbors from the existing
@@ -233,7 +266,7 @@ export function FindingReader({ atomId }: FindingReaderProps) {
           that doubles as a jump-into-canvas affordance. Desktop floats
           the canvas right of the prose; mobile stacks it above so the
           text isn't pushed into a narrow column. */}
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollerRef} className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-6 py-8">
           {!isMobile && citedAtomIds && citedAtomIds.length > 0 && (
             <div className="float-right ml-4 mb-4 w-80 aspect-[4/3]">
@@ -259,6 +292,7 @@ export function FindingReader({ atomId }: FindingReaderProps) {
             <BriefingContent
               content={content}
               citations={citationsForContent}
+              headingIdByOffset={headingIdByOffset}
               onCitationClick={handleCitationClick}
             />
           ) : isLoading ? (

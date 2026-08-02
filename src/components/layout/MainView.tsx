@@ -29,6 +29,8 @@ import { WikiFullView } from '../wiki/WikiFullView';
 import { WikiReader } from '../wiki/WikiReader';
 import { ReportsFullView, ReportDetailView, FindingReader } from '../reports';
 import { ChatViewer } from '../chat/ChatViewer';
+import { DatabaseSwitcher } from '../DatabaseSwitcher';
+import { SettingsButton } from '../settings';
 import { TabStrip } from './TabStrip';
 import { useAtomsStore } from '../../stores/atoms';
 import { useUIStore } from '../../stores/ui';
@@ -399,6 +401,17 @@ export function MainView() {
               <ListIcon className="w-4 h-4" strokeWidth={2} />
             </button>
           </div>
+        )}
+
+        {/* Database switcher — the wrapper's explicit width is load-bearing:
+            the dropdown is pinned `left-0 right-0` to this box, so without it
+            the menu would size itself to the active database's name. */}
+        <div className="relative w-40 max-md:w-28 shrink-0">
+          <DatabaseSwitcher />
+        </div>
+
+        {!isDemoInstance() && (
+          <SettingsButton onClick={() => window.dispatchEvent(new CustomEvent('open-settings'))} />
         )}
 
         {/* Chat sidebar toggle */}

@@ -9,7 +9,6 @@ export function WikiFullView() {
   const suggestedArticles = useWikiStore(s => s.suggestedArticles);
   const isLoadingList = useWikiStore(s => s.isLoadingList);
   const fetchAllArticles = useWikiStore(s => s.fetchAllArticles);
-  const reset = useWikiStore(s => s.reset);
 
   const openWikiReader = useUIStore(s => s.openWikiReader);
 
@@ -22,10 +21,9 @@ export function WikiFullView() {
     fetchAllArticles();
   }, [fetchAllArticles]);
 
-  // Clean up wiki store state on unmount
-  useEffect(() => {
-    return () => { reset(); };
-  }, [reset]);
+  // No unmount reset: opening a reader tab unmounts this view, and wiping the
+  // store there costs the sidebar list its data on every tab open/close.
+  // Switching databases still resets it — see stores/databases.ts.
 
   const handleArticleClick = (tagId: string, tagName: string, opts?: { newTab?: boolean }) => {
     openWikiReader(tagId, tagName, undefined, opts);

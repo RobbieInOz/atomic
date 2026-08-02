@@ -13,6 +13,15 @@ const EditorHarnessPage = lazy(async () => {
   return { default: mod.EditorHarnessPage };
 });
 
+// Standalone /toc-harness page used while building the contextual sidebar's
+// table of contents — exercises heading parsing, click-to-scroll, and scroll
+// tracking against both rendered markdown and CodeMirror before the readers
+// depend on any of it. Lazy-loaded so the main app bundle is unaffected.
+const TocHarnessPage = lazy(async () => {
+  const mod = await import('./components/toc-harness/TocHarnessPage');
+  return { default: mod.TocHarnessPage };
+});
+
 function App() {
   // Initialize embedding event listener
   useEmbeddingEvents();
@@ -36,6 +45,14 @@ function App() {
           element={
             <Suspense fallback={null}>
               <EditorHarnessPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/toc-harness"
+          element={
+            <Suspense fallback={null}>
+              <TocHarnessPage />
             </Suspense>
           }
         />

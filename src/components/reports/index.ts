@@ -2,6 +2,7 @@ export { ReportsFullView } from './ReportsFullView';
 export { ReportDetailView } from './ReportDetailView';
 export { FindingReader } from './FindingReader';
 export { FindingsList } from './FindingsList';
+export { LatestFindingsPanel } from './LatestFindingsPanel';
 export { FindingRow } from './FindingRow';
 export { FeaturedStarButton } from './FeaturedStarButton';
 export { FeaturedDropdown } from './FeaturedDropdown';

@@ -1,13 +1,22 @@
 import { Fragment, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import type { Element } from 'hast';
 import { CitationLink } from '../../wiki/CitationLink';
 import type { FindingCitation } from '../../../stores/featuredReport';
 
 interface BriefingContentProps {
   content: string;
   citations: FindingCitation[];
+  /** Ids to stamp on rendered headings, keyed by their offset in `content`.
+   *  Opt-in: only surfaces that drive a table of contents pass it. */
+  headingIdByOffset?: Map<number, string>;
   onCitationClick: (citation: FindingCitation, element: HTMLElement) => void;
+}
+
+interface HeadingProps {
+  node?: Element;
+  children?: ReactNode;
 }
 
 /**
@@ -15,7 +24,7 @@ interface BriefingContentProps {
  * clickable CitationLink buttons. Intentionally simpler than WikiArticleContent:
  * no wiki-links, no search highlighting, no related tags.
  */
-export function BriefingContent({ content, citations, onCitationClick }: BriefingContentProps) {
+export function BriefingContent({ content, citations, headingIdByOffset, onCitationClick }: BriefingContentProps) {
   const citationMap = new Map(citations.map(c => [c.citation_index, c]));
 
   const processTextWithCitations = (text: string): (string | JSX.Element)[] => {
@@ -48,6 +57,14 @@ export function BriefingContent({ content, citations, onCitationClick }: Briefin
     return children;
   };
 
+  // Heading ids are matched by source offset rather than re-slugged from the
+  // rendered text, so they survive the demotion below and stay identical to
+  // whatever outline the caller parsed.
+  const headingId = (node?: Element): string | undefined => {
+    const offset = node?.position?.start?.offset;
+    return offset === undefined ? undefined : headingIdByOffset?.get(offset);
+  };
+
   // Agent-authored markdown is body content, not page structure: whatever
   // heading level the model chose, it renders as a modest section header
   // and can never compete with the app's own chrome. h1–h3 demote to a
@@ -58,12 +75,12 @@ export function BriefingContent({ content, citations, onCitationClick }: Briefin
     li: ({ children }: { children?: ReactNode }) => <li>{processChildren(children)}</li>,
     strong: ({ children }: { children?: ReactNode }) => <strong>{processChildren(children)}</strong>,
     em: ({ children }: { children?: ReactNode }) => <em>{processChildren(children)}</em>,
-    h1: ({ children }: { children?: ReactNode }) => <h3>{processChildren(children)}</h3>,
-    h2: ({ children }: { children?: ReactNode }) => <h3>{processChildren(children)}</h3>,
-    h3: ({ children }: { children?: ReactNode }) => <h3>{processChildren(children)}</h3>,
-    h4: ({ children }: { children?: ReactNode }) => <h4>{processChildren(children)}</h4>,
-    h5: ({ children }: { children?: ReactNode }) => <h4>{processChildren(children)}</h4>,
-    h6: ({ children }: { children?: ReactNode }) => <h4>{processChildren(children)}</h4>,
+    h1: ({ node, children }: HeadingProps) => <h3 id={headingId(node)}>{processChildren(children)}</h3>,
+    h2: ({ node, children }: HeadingProps) => <h3 id={headingId(node)}>{processChildren(children)}</h3>,
+    h3: ({ node, children }: HeadingProps) => <h3 id={headingId(node)}>{processChildren(children)}</h3>,
+    h4: ({ node, children }: HeadingProps) => <h4 id={headingId(node)}>{processChildren(children)}</h4>,
+    h5: ({ node, children }: HeadingProps) => <h4 id={headingId(node)}>{processChildren(children)}</h4>,
+    h6: ({ node, children }: HeadingProps) => <h4 id={headingId(node)}>{processChildren(children)}</h4>,
   };
 
   return (
