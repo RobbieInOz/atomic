@@ -956,13 +956,13 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const [autoTaggingEnabled, setAutoTaggingEnabled] = useState(true);
   const [embeddingModel, setEmbeddingModel] = useState('openai/text-embedding-3-small');
   const [taggingModel, setTaggingModel] = useState('openai/gpt-4o-mini');
-  const [wikiModel, setWikiModel] = useState('anthropic/claude-sonnet-4.6');
+  const [wikiModel, setWikiModel] = useState('anthropic/claude-sonnet-5');
   const [wikiStrategy, setWikiStrategy] = useState('centroid');
   const [wikiGenerationPrompt, setWikiGenerationPrompt] = useState('');
   const [wikiUpdatePrompt, setWikiUpdatePrompt] = useState('');
   const [chatPrompt, setChatPrompt] = useState('');
   const [taggingPrompt, setTaggingPrompt] = useState('');
-  const [chatModel, setChatModel] = useState('anthropic/claude-sonnet-4.6');
+  const [chatModel, setChatModel] = useState('anthropic/claude-sonnet-5');
   const [saveError, setSaveError] = useState<string | null>(null);
 
   // Re-embedding confirmation
@@ -1422,13 +1422,13 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     setAutoTaggingEnabled(settings.auto_tagging_enabled !== 'false');
     setEmbeddingModel(settings.embedding_model || 'openai/text-embedding-3-small');
     setTaggingModel(settings.tagging_model || 'openai/gpt-4o-mini');
-    setWikiModel(settings.wiki_model || 'anthropic/claude-sonnet-4.6');
+    setWikiModel(settings.wiki_model || 'anthropic/claude-sonnet-5');
     setWikiStrategy(settings.wiki_strategy || 'centroid');
     setWikiGenerationPrompt(settings.wiki_generation_prompt || '');
     setWikiUpdatePrompt(settings.wiki_update_prompt || '');
     setChatPrompt(settings.chat_prompt || '');
     setTaggingPrompt(settings.tagging_prompt || '');
-    setChatModel(settings.chat_model || 'anthropic/claude-sonnet-4.6');
+    setChatModel(settings.chat_model || 'anthropic/claude-sonnet-5');
     setOllamaHost(settings.ollama_host || 'http://127.0.0.1:11434');
     setOllamaEmbeddingModel(settings.ollama_embedding_model || 'nomic-embed-text');
     setOllamaLlmModel(settings.ollama_llm_model || 'llama3.2');

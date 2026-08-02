@@ -18,6 +18,7 @@ interface ChatToolComplete {
   conversation_id: string;
   tool_call_id: string;
   results_count: number;
+  failed: boolean;
 }
 
 interface ChatComplete {
@@ -30,12 +31,18 @@ interface ChatError {
   error: string;
 }
 
+interface ChatConversationUpdated {
+  conversation_id: string;
+  title: string;
+}
+
 export function useChatEvents(conversationId: string | null) {
   const appendStreamContent = useChatStore(s => s.appendStreamContent);
   const startStreamingToolCall = useChatStore(s => s.startStreamingToolCall);
   const completeStreamingToolCall = useChatStore(s => s.completeStreamingToolCall);
   const completeMessage = useChatStore(s => s.completeMessage);
   const setStreamingError = useChatStore(s => s.setStreamingError);
+  const applyConversationTitle = useChatStore(s => s.applyConversationTitle);
 
   useEffect(() => {
     if (!conversationId) return;
@@ -64,6 +71,7 @@ export function useChatEvents(conversationId: string | null) {
         completeStreamingToolCall({
           tool_call_id: payload.tool_call_id,
           results_count: payload.results_count,
+          failed: payload.failed ?? false,
         });
       }
     }));
@@ -80,8 +88,16 @@ export function useChatEvents(conversationId: string | null) {
       }
     }));
 
+    // The auto-generated title lands after the turn completes; applying it
+    // here updates the header and the list entry without a refetch.
+    unsubs.push(transport.subscribe<ChatConversationUpdated>('chat-conversation-updated', (payload) => {
+      if (payload.conversation_id === conversationId) {
+        applyConversationTitle(payload.conversation_id, payload.title);
+      }
+    }));
+
     return () => {
       unsubs.forEach((unsub) => unsub());
     };
-  }, [conversationId, appendStreamContent, startStreamingToolCall, completeStreamingToolCall, completeMessage, setStreamingError]);
+  }, [conversationId, appendStreamContent, startStreamingToolCall, completeStreamingToolCall, completeMessage, setStreamingError, applyConversationTitle]);
 }

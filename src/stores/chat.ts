@@ -125,10 +125,27 @@ interface ChatStore {
   // Conversations list
   conversations: ConversationWithTags[];
   listFilterTagId: string | null;
+  /** Archived conversations are hidden until the list asks for them. */
+  showArchived: boolean;
+
+  /**
+   * Conversations where the user dismissed the page-context chip. Client-side
+   * and per-session by design: what the current page is has no meaning to the
+   * server between requests, so persisting the choice would outlive the
+   * context it was made about.
+   */
+  pageContextOff: Record<string, boolean>;
 
   // Streaming state
   isLoading: boolean;
   isStreaming: boolean;
+  /**
+   * A stop has been requested for the current turn. The backend finishes the
+   * turn by persisting the partial answer, so streaming state stays up until
+   * the completion event arrives — this only drives the button's pending look
+   * and keeps repeat clicks from piling up requests.
+   */
+  isCancelling: boolean;
   streamingContent: string;
   streamingMessageId: string | null;
   /**
@@ -150,25 +167,31 @@ interface ChatStore {
 
   // Actions - CRUD
   fetchConversations: (tagId?: string) => Promise<void>;
+  setShowArchived: (show: boolean) => Promise<void>;
   createConversation: (tagIds?: string[]) => Promise<ConversationWithTags>;
   deleteConversation: (id: string) => Promise<void>;
   updateConversationTitle: (id: string, title: string) => Promise<void>;
+  setConversationArchived: (id: string, isArchived: boolean) => Promise<void>;
+
+  // Actions - Page context
+  setPageContextEnabled: (conversationId: string, enabled: boolean) => void;
 
   // Actions - Scope Management
   setScope: (tagIds: string[]) => Promise<void>;
   addTagToScope: (tagId: string) => Promise<void>;
   removeTagFromScope: (tagId: string) => Promise<void>;
 
-  // Actions - Messaging (placeholder for now)
+  // Actions - Messaging
   sendMessage: (content: string) => Promise<void>;
-  cancelResponse: () => void;
+  cancelResponse: () => Promise<void>;
 
   // Actions - Streaming updates (called from event handlers)
   appendStreamContent: (delta: string) => void;
   startStreamingToolCall: (call: { tool_call_id: string; tool_name: string; tool_input: unknown }) => void;
-  completeStreamingToolCall: (update: { tool_call_id: string; results_count: number }) => void;
+  completeStreamingToolCall: (update: { tool_call_id: string; results_count: number; failed: boolean }) => void;
   completeMessage: (message: ChatMessageWithContext) => void;
   setStreamingError: (error: string) => void;
+  applyConversationTitle: (id: string, title: string) => void;
 
   // Actions - Utilities
   clearError: () => void;
@@ -182,8 +205,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   messages: [],
   conversations: [],
   listFilterTagId: null,
+  showArchived: false,
+  pageContextOff: {},
   isLoading: false,
   isStreaming: false,
+  isCancelling: false,
   streamingContent: '',
   streamingMessageId: null,
   streamingToolCalls: [],
@@ -288,11 +314,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         filterTagId: tagId ?? null,
         limit: 50,
         offset: 0,
+        includeArchived: get().showArchived,
       });
       set({ conversations, isLoading: false, listFilterTagId: tagId ?? null });
     } catch (e) {
       set({ error: String(e), isLoading: false });
     }
+  },
+
+  setShowArchived: async (show: boolean) => {
+    set({ showArchived: show });
+    await get().fetchConversations(get().listFilterTagId ?? undefined);
   },
 
   createConversation: async (tagIds?: string[]) => {
@@ -337,18 +369,36 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   updateConversationTitle: async (id: string, title: string) => {
     try {
       await getTransport().invoke('update_conversation', { id, title, isArchived: null });
+      get().applyConversationTitle(id, title);
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  setConversationArchived: async (id: string, isArchived: boolean) => {
+    try {
+      await getTransport().invoke('update_conversation', { id, title: null, isArchived });
       set((state) => ({
-        conversations: state.conversations.map((c) =>
-          c.id === id ? { ...c, title } : c
-        ),
+        // The list only holds archived conversations while it is showing
+        // them; otherwise archiving removes the card outright.
+        conversations: state.showArchived
+          ? state.conversations.map((c) => (c.id === id ? { ...c, is_archived: isArchived } : c))
+          : state.conversations.filter((c) => c.id !== id),
         currentConversation:
           state.currentConversation?.id === id
-            ? { ...state.currentConversation, title }
+            ? { ...state.currentConversation, is_archived: isArchived }
             : state.currentConversation,
       }));
     } catch (e) {
       set({ error: String(e) });
     }
+  },
+
+  // Page context
+  setPageContextEnabled: (conversationId: string, enabled: boolean) => {
+    set((state) => ({
+      pageContextOff: { ...state.pageContextOff, [conversationId]: !enabled },
+    }));
   },
 
   // Scope Management
@@ -420,6 +470,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set({
       messages: [...messages, userMessage],
       isStreaming: true,
+      isCancelling: false,
       streamingContent: '',
       streamingToolCalls: [],
       error: null,
@@ -440,11 +491,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
       }
 
+      // Dismissing the context chip is a promise that nothing about the
+      // current page leaves with the message.
+      const sharesPageContext = !get().pageContextOff[currentConversation.id];
+
       await getTransport().invoke<ChatMessageWithContext>('send_chat_message', {
         conversationId: currentConversation.id,
         content,
         canvasContext,
-        pageContext: buildPageContext(),
+        pageContext: sharesPageContext ? buildPageContext() : undefined,
       });
 
       // Refetch the conversation to get the properly saved messages
@@ -456,19 +511,33 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         messages: state.messages.filter((m) => !m.id.startsWith('temp-')),
         error: String(e),
         isStreaming: false,
+        isCancelling: false,
         streamingContent: '',
       }));
     }
   },
 
-  cancelResponse: () => {
-    // TODO: Implement cancellation
-    set({ isStreaming: false, streamingContent: '' });
+  cancelResponse: async () => {
+    const { currentConversation, isStreaming, isCancelling } = get();
+    if (!currentConversation || !isStreaming || isCancelling) return;
+
+    set({ isCancelling: true });
+    try {
+      await getTransport().invoke('cancel_chat_message', {
+        conversationId: currentConversation.id,
+      });
+      // The turn keeps streaming until the backend finalizes the partial
+      // answer; completeMessage clears the streaming state from the event.
+    } catch (e) {
+      // The request never landed — nothing is coming back to clear the UI,
+      // so drop the streaming state here.
+      set({ isStreaming: false, isCancelling: false, streamingContent: '', error: String(e) });
+    }
   },
 
-  // Streaming updates - receives full accumulated content from backend
-  appendStreamContent: (content: string) => {
-    set({ streamingContent: content });
+  // Streaming updates - deltas arrive one provider chunk at a time
+  appendStreamContent: (delta: string) => {
+    set((state) => ({ streamingContent: state.streamingContent + delta }));
   },
 
   startStreamingToolCall: ({ tool_call_id, tool_name, tool_input }) => {
@@ -490,14 +559,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
-  completeStreamingToolCall: ({ tool_call_id, results_count }) => {
+  completeStreamingToolCall: ({ tool_call_id, results_count, failed }) => {
     const now = new Date().toISOString();
     set((state) => ({
       streamingToolCalls: state.streamingToolCalls.map((call) =>
         call.id === tool_call_id
           ? {
               ...call,
-              status: 'complete' as const,
+              status: failed ? ('failed' as const) : ('complete' as const),
               tool_output: { results_count },
               completed_at: now,
             }
@@ -513,6 +582,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       if (messageExists) {
         return {
           isStreaming: false,
+          isCancelling: false,
           streamingContent: '',
           streamingMessageId: null,
           streamingToolCalls: [],
@@ -521,6 +591,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return {
         messages: [...state.messages, message],
         isStreaming: false,
+        isCancelling: false,
         streamingContent: '',
         streamingMessageId: null,
         streamingToolCalls: [],
@@ -532,8 +603,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set({
       error,
       isStreaming: false,
+      isCancelling: false,
       streamingContent: '',
     });
+  },
+
+  applyConversationTitle: (id: string, title: string) => {
+    set((state) => ({
+      conversations: state.conversations.map((c) => (c.id === id ? { ...c, title } : c)),
+      currentConversation:
+        state.currentConversation?.id === id
+          ? { ...state.currentConversation, title }
+          : state.currentConversation,
+    }));
   },
 
   // Utilities
@@ -546,8 +628,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       messages: [],
       conversations: [],
       listFilterTagId: null,
+      showArchived: false,
+      pageContextOff: {},
       isLoading: false,
       isStreaming: false,
+      isCancelling: false,
       streamingContent: '',
       streamingMessageId: null,
       streamingToolCalls: [],

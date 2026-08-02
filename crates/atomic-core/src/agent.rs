@@ -21,10 +21,19 @@ use crate::storage::StorageBackend;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
-type ChatEventCallback = Arc<dyn Fn(ChatEvent) + Send + Sync + 'static>;
+pub(crate) type ChatEventCallback = Arc<dyn Fn(ChatEvent) + Send + Sync + 'static>;
+
+/// Cooperative cancellation handle for one in-flight chat turn. Raise the
+/// flag and the agent loop stops at its next checkpoint — between iterations,
+/// between sequential tool executions, and mid-stream — then persists and
+/// returns whatever text it had already produced. Hosts own the registry
+/// (see `atomic-server`'s cancellation registry); the loop only reads it.
+pub type ChatCancel = Arc<AtomicBool>;
 
 // ==================== Chat Events ====================
 
@@ -33,7 +42,9 @@ type ChatEventCallback = Arc<dyn Fn(ChatEvent) + Send + Sync + 'static>;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ChatEvent {
-    /// Streaming content delta (accumulated)
+    /// One incremental chunk of assistant text, emitted as the provider
+    /// streams it. Consumers append; the authoritative full text arrives with
+    /// [`ChatEvent::Complete`].
     StreamDelta {
         conversation_id: String,
         content: String,
@@ -45,11 +56,14 @@ pub enum ChatEvent {
         tool_name: String,
         tool_input: serde_json::Value,
     },
-    /// Tool execution completed
+    /// Tool execution completed. `failed` mirrors the persisted
+    /// `chat_tool_calls.status`, so a tool that errored reads as failed while
+    /// the turn is still streaming — not only after the final message lands.
     ToolComplete {
         conversation_id: String,
         tool_call_id: String,
         results_count: i32,
+        failed: bool,
     },
     /// Full message completed
     Complete {
@@ -76,6 +90,12 @@ pub enum ChatEvent {
     AtomPipelineEvent {
         conversation_id: String,
         event: EmbeddingEvent,
+    },
+    /// Conversation metadata changed outside a request/response cycle —
+    /// today, the auto-generated title landing after the turn completed.
+    ConversationUpdated {
+        conversation_id: String,
+        title: String,
     },
     /// Error during chat
     Error {
@@ -417,7 +437,6 @@ async fn execute_search_atoms(
             .map_err(|e| e.to_string())?,
     };
     let config = ProviderConfig::from_settings(&settings);
-    let tag_id = scope_tag_ids.first().map(|s| s.as_str());
 
     // Generate query embedding
     let provider = crate::providers::get_embedding_provider(&config).map_err(|e| e.to_string())?;
@@ -436,12 +455,19 @@ async fn execute_search_atoms(
     // its default KindFilter::All).
     let kinds = crate::models::KindFilter::All;
     let keyword = storage
-        .keyword_search_sync(query, limit * 2, tag_id, cutoff_ref, &kinds)
+        .keyword_search_sync(query, limit * 2, scope_tag_ids, cutoff_ref, &kinds)
         .await
         .map_err(|e| e.to_string())?;
     let semantic = if !embeddings.is_empty() && !embeddings[0].is_empty() {
         storage
-            .vector_search_sync(&embeddings[0], limit * 2, 0.3, tag_id, cutoff_ref, &kinds)
+            .vector_search_sync(
+                &embeddings[0],
+                limit * 2,
+                0.3,
+                scope_tag_ids,
+                cutoff_ref,
+                &kinds,
+            )
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -913,6 +939,110 @@ struct AgentContext {
     tool_calls_record: Vec<ChatToolCall>,
 }
 
+/// Outcome of a single tool execution. `failed` is tracked separately from
+/// `output` because the error text still has to reach the model (and the UI's
+/// tool card), while `chat_tool_calls.status` must say what actually happened.
+struct ToolOutcome {
+    output: String,
+    results_count: i32,
+    failed: bool,
+}
+
+impl ToolOutcome {
+    fn ok(output: impl Into<String>, results_count: i32) -> Self {
+        Self {
+            output: output.into(),
+            results_count,
+            failed: false,
+        }
+    }
+
+    fn failed(error: impl std::fmt::Display) -> Self {
+        Self {
+            output: format!("Error: {}", error),
+            results_count: 0,
+            failed: true,
+        }
+    }
+}
+
+/// Tool-calling rounds a single turn may take before the loop gives up and
+/// salvages whatever answer it has.
+const MAX_ITERATIONS: usize = 10;
+
+/// How often the loop samples the cancellation flag while a provider stream
+/// is in flight. Cancellation is cooperative and user-facing, so the bound
+/// only has to be imperceptible, not instant.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Appended to the assistant message when the user stopped the turn.
+const STOPPED_MARKER: &str = "*(stopped)*";
+
+/// Appended to the assistant message when the tool-call budget ran out.
+const ITERATION_CAP_NOTE: &str = "*(reached tool-call limit — answer may be incomplete)*";
+
+fn is_cancelled(cancel: &Option<ChatCancel>) -> bool {
+    cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+/// Resolves once `cancel` is raised; never resolves when there is no flag.
+/// Polling keeps cancellation out of the provider traits — the loop races
+/// this against the in-flight request and drops the request future on cancel.
+async fn cancellation_raised(cancel: &Option<ChatCancel>) {
+    match cancel {
+        Some(flag) => {
+            while !flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Attach a trailing note to a partial answer, keeping the note readable when
+/// there is no text to attach it to.
+fn with_note(text: &str, note: &str) -> String {
+    let text = text.trim_end();
+    if text.is_empty() {
+        note.to_string()
+    } else {
+        format!("{}\n\n{}", text, note)
+    }
+}
+
+/// Turn the accumulated agent context into the assistant message to persist.
+fn build_result(ctx: AgentContext, content: String) -> ChatMessageWithContext {
+    let citations: Vec<ChatCitation> = ctx
+        .citations
+        .iter()
+        .enumerate()
+        .map(|(i, (atom_id, chunk_index, excerpt))| ChatCitation {
+            id: Uuid::new_v4().to_string(),
+            message_id: String::new(), // Set when saving
+            citation_index: (i + 1) as i32,
+            atom_id: atom_id.clone(),
+            chunk_index: *chunk_index,
+            excerpt: excerpt.clone(),
+            relevance_score: None,
+        })
+        .collect();
+
+    ChatMessageWithContext {
+        message: ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            conversation_id: ctx.conversation_id.clone(),
+            role: "assistant".to_string(),
+            content,
+            created_at: Utc::now().to_rfc3339(),
+            message_index: 0, // Set when saving
+        },
+        tool_calls: ctx.tool_calls_record,
+        citations,
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Internal loop entry; each argument is a distinct context channel.
 async fn run_agent_loop(
     on_event: ChatEventCallback,
@@ -925,6 +1055,7 @@ async fn run_agent_loop(
     page_context: Option<&PageContext>,
     canvas_context: Option<&CanvasContext>,
     canvas_cache: Option<&crate::CanvasCache>,
+    cancel: Option<ChatCancel>,
 ) -> Result<ChatMessageWithContext, String> {
     let provider = create_streaming_llm_provider(&provider_config)
         .map_err(|e| format!("Failed to create streaming provider: {}", e))?;
@@ -945,27 +1076,30 @@ async fn run_agent_loop(
             });
         })
     };
-    let max_iterations = 10;
+    let config = LlmConfig::new(&model).with_params(
+        GenerationParams::new()
+            .with_temperature(0.7)
+            .with_max_tokens(4000),
+    );
 
-    for _iteration in 0..max_iterations {
-        let config = LlmConfig::new(&model).with_params(
-            GenerationParams::new()
-                .with_temperature(0.7)
-                .with_max_tokens(4000),
+    // Every token the model streams this turn, across all iterations — the
+    // same text the UI has been rendering. Only used when the turn ends
+    // without a clean final answer (stopped, or out of tool-call budget).
+    let streamed = Arc::new(Mutex::new(String::new()));
+    let mut stopped = false;
+
+    for _iteration in 0..MAX_ITERATIONS {
+        if is_cancelled(&cancel) {
+            stopped = true;
+            break;
+        }
+
+        let on_delta = make_delta_callback(
+            Arc::clone(&on_event),
+            Arc::clone(&streamed),
+            ctx.conversation_id.clone(),
+            cancel.clone(),
         );
-
-        // Accumulate streaming content. The Box callback captures an Arc<Mutex<String>>
-        // because we can't capture `on_event` (lifetime/Send issues with Box<dyn Fn>).
-        // We emit the accumulated content as a StreamDelta after the call completes.
-        let accumulated_content = Arc::new(Mutex::new(String::new()));
-        let accumulated_clone = Arc::clone(&accumulated_content);
-
-        let on_delta = Box::new(move |delta: StreamDelta| {
-            if let StreamDelta::Content(text) = delta {
-                let mut content = accumulated_clone.lock().unwrap();
-                content.push_str(&text);
-            }
-        });
 
         // Truncate messages if they've grown beyond context window (from tool results)
         let call_messages = truncate_messages_to_context(
@@ -973,20 +1107,29 @@ async fn run_agent_loop(
             provider_config.context_length_for_model(&model),
         );
 
-        let response = provider
-            .complete_streaming_with_tools(&call_messages, &tools, &config, on_delta)
-            .await
-            .map_err(|e| format!("API request failed: {}", e))?;
-
-        // Emit the accumulated content as a stream delta
-        if let Ok(content) = accumulated_content.lock() {
-            if !content.is_empty() {
-                on_event(ChatEvent::StreamDelta {
-                    conversation_id: ctx.conversation_id.clone(),
-                    content: content.clone(),
-                });
+        // Racing the request against the cancel flag drops the request future
+        // on cancel, which tears down the in-flight HTTP stream instead of
+        // paying for tokens nobody will read.
+        let response = tokio::select! {
+            biased;
+            result = provider.complete_streaming_with_tools(&call_messages, &tools, &config, on_delta) => {
+                match result {
+                    Ok(response) => response,
+                    Err(e) => {
+                        let error = format!("API request failed: {}", e);
+                        on_event(ChatEvent::Error {
+                            conversation_id: ctx.conversation_id.clone(),
+                            error: error.clone(),
+                        });
+                        return Err(error);
+                    }
+                }
             }
-        }
+            _ = cancellation_raised(&cancel) => {
+                stopped = true;
+                break;
+            }
+        };
 
         // Check if there are tool calls
         if let Some(tool_calls) = &response.tool_calls {
@@ -1002,6 +1145,10 @@ async fn run_agent_loop(
 
             // Execute each tool call
             for tool_call in tool_calls {
+                if is_cancelled(&cancel) {
+                    stopped = true;
+                    break;
+                }
                 let tool_name = tool_call.get_name().unwrap_or_default();
                 let tool_args_str = tool_call.get_arguments().unwrap_or_default();
                 let tool_args: serde_json::Value =
@@ -1016,7 +1163,7 @@ async fn run_agent_loop(
                 });
 
                 // Execute tool
-                let (tool_result, results_count) = match tool_name {
+                let outcome = match tool_name {
                     "search_atoms" => {
                         let query = tool_args["query"].as_str().unwrap_or("");
                         let limit = tool_args["limit"].as_i64().unwrap_or(5) as i32;
@@ -1058,9 +1205,9 @@ async fn run_agent_loop(
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n\n");
-                                (result_text, count)
+                                ToolOutcome::ok(result_text, count)
                             }
-                            Err(e) => (format!("Error: {}", e), 0),
+                            Err(e) => ToolOutcome::failed(e),
                         }
                     }
                     "get_atom" => {
@@ -1083,7 +1230,7 @@ async fn run_agent_loop(
                                     None,
                                     content.chars().take(200).collect(),
                                 ));
-                                (
+                                ToolOutcome::ok(
                                     format!(
                                         "[{}] (atom_id: {})\n{}",
                                         citation_index, atom_id, content
@@ -1091,8 +1238,8 @@ async fn run_agent_loop(
                                     1,
                                 )
                             }
-                            Ok(None) => ("Atom not found".to_string(), 0),
-                            Err(e) => (format!("Error: {}", e), 0),
+                            Ok(None) => ToolOutcome::ok("Atom not found", 0),
+                            Err(e) => ToolOutcome::failed(e),
                         }
                     }
                     "get_current_page_context" => {
@@ -1128,14 +1275,14 @@ async fn run_agent_loop(
                                     }
                                 }
 
-                                (
+                                ToolOutcome::ok(
                                     serde_json::to_string_pretty(&context)
                                         .unwrap_or_else(|_| context.to_string()),
                                     1,
                                 )
                             }
-                            Ok(None) => ("No current page context was provided.".to_string(), 0),
-                            Err(e) => (format!("Error: {}", e), 0),
+                            Ok(None) => ToolOutcome::ok("No current page context was provided.", 0),
+                            Err(e) => ToolOutcome::failed(e),
                         }
                     }
                     "create_atom" => {
@@ -1159,7 +1306,7 @@ async fn run_agent_loop(
                                     None,
                                     atom.atom.snippet.chars().take(200).collect(),
                                 ));
-                                (
+                                ToolOutcome::ok(
                                     serde_json::to_string_pretty(&json!({
                                         "atom_id": atom.atom.id,
                                         "title": atom.atom.title,
@@ -1170,7 +1317,7 @@ async fn run_agent_loop(
                                     1,
                                 )
                             }
-                            Err(e) => (format!("Error: {}", e), 0),
+                            Err(e) => ToolOutcome::failed(e),
                         }
                     }
                     "edit_atom" => {
@@ -1194,7 +1341,7 @@ async fn run_agent_loop(
                                     None,
                                     atom.atom.snippet.chars().take(200).collect(),
                                 ));
-                                (
+                                ToolOutcome::ok(
                                     serde_json::to_string_pretty(&json!({
                                         "atom_id": atom.atom.id,
                                         "title": atom.atom.title,
@@ -1205,8 +1352,8 @@ async fn run_agent_loop(
                                     1,
                                 )
                             }
-                            Ok(None) => ("Atom not found".to_string(), 0),
-                            Err(e) => (format!("Error: {}", e), 0),
+                            Ok(None) => ToolOutcome::ok("Atom not found", 0),
+                            Err(e) => ToolOutcome::failed(e),
                         }
                     }
                     "zoom_to_cluster" => {
@@ -1216,7 +1363,7 @@ async fn run_agent_loop(
                             action: "zoom_to_cluster".to_string(),
                             params: json!({ "cluster_label": cluster_label }),
                         });
-                        (format!("Zoomed canvas to cluster '{}'", cluster_label), 1)
+                        ToolOutcome::ok(format!("Zoomed canvas to cluster '{}'", cluster_label), 1)
                     }
                     "focus_atom" => {
                         let atom_id = tool_args["atom_id"].as_str().unwrap_or("");
@@ -1225,9 +1372,11 @@ async fn run_agent_loop(
                             action: "focus_atom".to_string(),
                             params: json!({ "atom_id": atom_id }),
                         });
-                        (format!("Focused canvas on atom '{}'", atom_id), 1)
+                        ToolOutcome::ok(format!("Focused canvas on atom '{}'", atom_id), 1)
                     }
-                    _ => (format!("Unknown tool: {}", tool_name), 0),
+                    // The model asked for a tool this build doesn't have —
+                    // a failed call, not an empty result.
+                    _ => ToolOutcome::failed(format!("Unknown tool: {}", tool_name)),
                 };
 
                 // Record tool call
@@ -1236,8 +1385,12 @@ async fn run_agent_loop(
                     message_id: String::new(), // Set when saving
                     tool_name: tool_name.to_string(),
                     tool_input: tool_args,
-                    tool_output: Some(serde_json::Value::String(tool_result.clone())),
-                    status: "complete".to_string(),
+                    tool_output: Some(serde_json::Value::String(outcome.output.clone())),
+                    status: if outcome.failed {
+                        "failed".to_string()
+                    } else {
+                        "complete".to_string()
+                    },
                     created_at: Utc::now().to_rfc3339(),
                     completed_at: Some(Utc::now().to_rfc3339()),
                 });
@@ -1246,49 +1399,85 @@ async fn run_agent_loop(
                 on_event(ChatEvent::ToolComplete {
                     conversation_id: ctx.conversation_id.clone(),
                     tool_call_id: tool_call.id.clone(),
-                    results_count,
+                    results_count: outcome.results_count,
+                    failed: outcome.failed,
                 });
 
                 // Add tool result to messages
                 ctx.messages
-                    .push(Message::tool_result(&tool_call.id, tool_result));
+                    .push(Message::tool_result(&tool_call.id, outcome.output));
+            }
+
+            if stopped {
+                break;
             }
         } else {
             // No tool calls - we have the final answer
-            let content = response.content;
-
-            // Build citations from collected data
-            let citations: Vec<ChatCitation> = ctx
-                .citations
-                .iter()
-                .enumerate()
-                .map(|(i, (atom_id, chunk_index, excerpt))| ChatCitation {
-                    id: Uuid::new_v4().to_string(),
-                    message_id: String::new(), // Set when saving
-                    citation_index: (i + 1) as i32,
-                    atom_id: atom_id.clone(),
-                    chunk_index: *chunk_index,
-                    excerpt: excerpt.clone(),
-                    relevance_score: None,
-                })
-                .collect();
-
-            return Ok(ChatMessageWithContext {
-                message: ChatMessage {
-                    id: Uuid::new_v4().to_string(),
-                    conversation_id: ctx.conversation_id.clone(),
-                    role: "assistant".to_string(),
-                    content,
-                    created_at: Utc::now().to_rfc3339(),
-                    message_index: 0, // Set when saving
-                },
-                tool_calls: ctx.tool_calls_record,
-                citations,
-            });
+            return Ok(build_result(ctx, response.content));
         }
     }
 
-    Err("Max iterations reached without completing".to_string())
+    let partial = streamed.lock().map(|text| text.clone()).unwrap_or_default();
+
+    if stopped {
+        return Ok(build_result(ctx, with_note(&partial, STOPPED_MARKER)));
+    }
+
+    // Out of tool-call budget. Salvage rather than discard: whatever the model
+    // already said stands as the answer, and when it said nothing at all we
+    // spend one more call — without tools, so it has to answer in prose from
+    // the context it gathered.
+    let salvaged = if partial.trim().is_empty() {
+        let call_messages = truncate_messages_to_context(
+            ctx.messages.clone(),
+            provider_config.context_length_for_model(&model),
+        );
+        let on_delta = make_delta_callback(
+            Arc::clone(&on_event),
+            Arc::clone(&streamed),
+            ctx.conversation_id.clone(),
+            cancel.clone(),
+        );
+        match provider
+            .complete_streaming_with_tools(&call_messages, &[], &config, on_delta)
+            .await
+        {
+            Ok(response) => response.content,
+            Err(e) => {
+                tracing::warn!(error = %e, "chat: iteration-cap salvage completion failed");
+                String::new()
+            }
+        }
+    } else {
+        partial
+    };
+
+    Ok(build_result(ctx, with_note(&salvaged, ITERATION_CAP_NOTE)))
+}
+
+/// Build the provider stream callback: forward every chunk to the UI as it
+/// arrives and keep a copy for the salvage paths.
+fn make_delta_callback(
+    on_event: ChatEventCallback,
+    streamed: Arc<Mutex<String>>,
+    conversation_id: String,
+    cancel: Option<ChatCancel>,
+) -> crate::providers::traits::StreamCallback {
+    Box::new(move |delta: StreamDelta| {
+        let StreamDelta::Content(text) = delta else {
+            return;
+        };
+        if text.is_empty() || is_cancelled(&cancel) {
+            return;
+        }
+        if let Ok(mut accumulated) = streamed.lock() {
+            accumulated.push_str(&text);
+        }
+        on_event(ChatEvent::StreamDelta {
+            conversation_id: conversation_id.clone(),
+            content: text,
+        });
+    })
 }
 
 // ==================== Public API ====================
@@ -1308,7 +1497,16 @@ pub async fn send_chat_message<F>(
 where
     F: Fn(ChatEvent) + Send + Sync + 'static,
 {
-    send_chat_message_with_settings(storage, conversation_id, content, on_event, None, true).await
+    send_chat_message_with_settings(
+        storage,
+        conversation_id,
+        content,
+        on_event,
+        None,
+        true,
+        None,
+    )
+    .await
 }
 
 /// Like `send_chat_message` but with externally-provided settings (from
@@ -1316,6 +1514,9 @@ where
 /// agent's tools execute their embedding/tagging jobs in-process (`true`,
 /// the default behavior) or leave them in the durable ledger for the host's
 /// dedicated pipeline worker (see `AtomicCore::set_inline_pipeline`).
+/// `cancel`, when supplied, lets the host stop the turn mid-flight; the
+/// partial answer is still persisted and returned.
+#[allow(clippy::too_many_arguments)] // Public chat entry; each argument is a distinct context channel.
 pub async fn send_chat_message_with_settings<F>(
     storage: StorageBackend,
     conversation_id: &str,
@@ -1323,6 +1524,7 @@ pub async fn send_chat_message_with_settings<F>(
     on_event: F,
     external_settings: Option<std::collections::HashMap<String, String>>,
     inline_pipeline: bool,
+    cancel: Option<ChatCancel>,
 ) -> Result<ChatMessageWithContext, String>
 where
     F: Fn(ChatEvent) + Send + Sync + 'static,
@@ -1385,9 +1587,14 @@ where
         .get_conversation_sync(conversation_id)
         .await
         .map_err(|e| e.to_string())?;
-    let messages = match conversation {
-        Some(conv) => chat_messages_to_provider_messages(conv.messages),
-        None => Vec::new(),
+    // A conversation with no title yet is a candidate for one once this turn
+    // lands; anything already titled skips the work entirely.
+    let (messages, untitled) = match conversation {
+        Some(conv) => (
+            chat_messages_to_provider_messages(conv.messages),
+            conv.conversation.title.is_none(),
+        ),
+        None => (Vec::new(), false),
     };
 
     // Build message history for API
@@ -1419,6 +1626,7 @@ where
     };
 
     // Run agent loop (storage is Clone, so no separate connection needed)
+    let title_settings = untitled.then(|| settings_map.clone());
     let mut result = run_agent_loop(
         Arc::clone(&on_event),
         storage.clone(),
@@ -1430,43 +1638,75 @@ where
         None,
         None,
         None,
+        cancel,
     )
     .await?;
 
-    // Save assistant message
-    {
-        let saved_msg = storage
-            .save_message_sync(conversation_id, "assistant", &result.message.content)
-            .await
-            .map_err(|e| e.to_string())?;
+    finish_turn(
+        &storage,
+        conversation_id,
+        &mut result,
+        &on_event,
+        title_settings,
+    )
+    .await?;
 
-        result.message.id = saved_msg.id.clone();
-        result.message.message_index = saved_msg.message_index;
+    Ok(result)
+}
 
-        for tool_call in &mut result.tool_calls {
-            tool_call.message_id = saved_msg.id.clone();
-        }
-        storage
-            .save_tool_calls_sync(&saved_msg.id, &result.tool_calls)
-            .await
-            .map_err(|e| e.to_string())?;
+/// Persist the assistant turn, tell the caller it landed, and name the
+/// conversation if it still has no title.
+///
+/// Shared by both public entrypoints: the tail of a turn is identical
+/// whatever context went into it, and the title hook has to hang off every
+/// path a first exchange can take. `title_settings` is `None` when the
+/// conversation was already titled when the turn started.
+async fn finish_turn(
+    storage: &StorageBackend,
+    conversation_id: &str,
+    result: &mut ChatMessageWithContext,
+    on_event: &ChatEventCallback,
+    title_settings: Option<std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
+    let saved_msg = storage
+        .save_message_sync(conversation_id, "assistant", &result.message.content)
+        .await
+        .map_err(|e| e.to_string())?;
 
-        for citation in &mut result.citations {
-            citation.message_id = saved_msg.id.clone();
-        }
-        storage
-            .save_citations_sync(&saved_msg.id, &result.citations)
-            .await
-            .map_err(|e| e.to_string())?;
+    result.message.id = saved_msg.id.clone();
+    result.message.message_index = saved_msg.message_index;
+
+    for tool_call in &mut result.tool_calls {
+        tool_call.message_id = saved_msg.id.clone();
     }
+    storage
+        .save_tool_calls_sync(&saved_msg.id, &result.tool_calls)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // Emit completion event
+    for citation in &mut result.citations {
+        citation.message_id = saved_msg.id.clone();
+    }
+    storage
+        .save_citations_sync(&saved_msg.id, &result.citations)
+        .await
+        .map_err(|e| e.to_string())?;
+
     on_event(ChatEvent::Complete {
         conversation_id: conversation_id.to_string(),
         message: result.clone(),
     });
 
-    Ok(result)
+    if let Some(settings) = title_settings {
+        crate::chat_title::spawn_generation(
+            storage.clone(),
+            settings,
+            conversation_id.to_string(),
+            Arc::clone(on_event),
+        );
+    }
+
+    Ok(())
 }
 
 /// Like `send_chat_message_with_settings` but with optional UI context for
@@ -1482,6 +1722,7 @@ pub async fn send_chat_message_with_canvas<F>(
     canvas_context: Option<CanvasContext>,
     page_context: Option<PageContext>,
     canvas_cache: Option<crate::CanvasCache>,
+    cancel: Option<ChatCancel>,
 ) -> Result<ChatMessageWithContext, String>
 where
     F: Fn(ChatEvent) + Send + Sync + 'static,
@@ -1544,9 +1785,14 @@ where
         .get_conversation_sync(conversation_id)
         .await
         .map_err(|e| e.to_string())?;
-    let messages = match conversation {
-        Some(conv) => chat_messages_to_provider_messages(conv.messages),
-        None => Vec::new(),
+    // A conversation with no title yet is a candidate for one once this turn
+    // lands; anything already titled skips the work entirely.
+    let (messages, untitled) = match conversation {
+        Some(conv) => (
+            chat_messages_to_provider_messages(conv.messages),
+            conv.conversation.title.is_none(),
+        ),
+        None => (Vec::new(), false),
     };
 
     // Build message history for API, with canvas context appended to system prompt
@@ -1584,6 +1830,7 @@ where
     };
 
     // Run agent loop with canvas context
+    let title_settings = untitled.then(|| settings_map.clone());
     let mut result = run_agent_loop(
         Arc::clone(&on_event),
         storage.clone(),
@@ -1595,41 +1842,18 @@ where
         page_context.as_ref(),
         canvas_context.as_ref(),
         canvas_cache.as_ref(),
+        cancel,
     )
     .await?;
 
-    // Save assistant message
-    {
-        let saved_msg = storage
-            .save_message_sync(conversation_id, "assistant", &result.message.content)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        result.message.id = saved_msg.id.clone();
-        result.message.message_index = saved_msg.message_index;
-
-        for tool_call in &mut result.tool_calls {
-            tool_call.message_id = saved_msg.id.clone();
-        }
-        storage
-            .save_tool_calls_sync(&saved_msg.id, &result.tool_calls)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        for citation in &mut result.citations {
-            citation.message_id = saved_msg.id.clone();
-        }
-        storage
-            .save_citations_sync(&saved_msg.id, &result.citations)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Emit completion event
-    on_event(ChatEvent::Complete {
-        conversation_id: conversation_id.to_string(),
-        message: result.clone(),
-    });
+    finish_turn(
+        &storage,
+        conversation_id,
+        &mut result,
+        &on_event,
+        title_settings,
+    )
+    .await?;
 
     Ok(result)
 }

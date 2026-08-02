@@ -264,13 +264,15 @@ impl ChatStore for PostgresStorage {
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>> {
+        let max_archived = i32::from(include_archived);
         let conversations: Vec<Conversation> = if let Some(tag_id) = filter_tag_id {
             let rows = sqlx::query_as::<_, (String, Option<String>, String, String, i32)>(
                 "SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at, c.is_archived
                  FROM conversations c
                  JOIN conversation_tags ct ON ct.conversation_id = c.id
-                 WHERE ct.tag_id = $1 AND c.is_archived = 0 AND c.db_id = $4 AND ct.db_id = $4
+                 WHERE ct.tag_id = $1 AND c.is_archived <= $5 AND c.db_id = $4 AND ct.db_id = $4
                  ORDER BY c.updated_at DESC
                  LIMIT $2 OFFSET $3",
             )
@@ -278,6 +280,7 @@ impl ChatStore for PostgresStorage {
             .bind(limit)
             .bind(offset)
             .bind(&self.db_id)
+            .bind(max_archived)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
@@ -297,13 +300,14 @@ impl ChatStore for PostgresStorage {
             let rows = sqlx::query_as::<_, (String, Option<String>, String, String, i32)>(
                 "SELECT id, title, created_at, updated_at, is_archived
                  FROM conversations
-                 WHERE is_archived = 0 AND db_id = $3
+                 WHERE is_archived <= $4 AND db_id = $3
                  ORDER BY updated_at DESC
                  LIMIT $1 OFFSET $2",
             )
             .bind(limit)
             .bind(offset)
             .bind(&self.db_id)
+            .bind(max_archived)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;

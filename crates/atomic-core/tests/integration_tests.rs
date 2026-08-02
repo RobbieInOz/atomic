@@ -267,7 +267,7 @@ async fn test_conversation_lifecycle() {
     assert_eq!(conv.tags.len(), 1);
 
     // List conversations
-    let convs = core.get_conversations(None, 10, 0).await.unwrap();
+    let convs = core.get_conversations(None, 10, 0, false).await.unwrap();
     assert_eq!(convs.len(), 1);
 
     // Update title
@@ -443,7 +443,7 @@ async fn test_empty_database_queries() {
     assert_eq!(page.total_count, 0);
     assert!(core.get_source_list().await.unwrap().is_empty());
     assert!(core
-        .get_conversations(None, 10, 0)
+        .get_conversations(None, 10, 0, false)
         .await
         .unwrap()
         .is_empty());

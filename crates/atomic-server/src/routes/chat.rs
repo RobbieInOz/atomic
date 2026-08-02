@@ -1,10 +1,11 @@
 //! Chat / Conversation routes
 
-use crate::db_extractor::Db;
+use crate::db_extractor::{job_scope, Db};
 use crate::error::{ok_or_error, ApiErrorResponse};
 use crate::event_bridge::chat_event_callback;
 use crate::event_channel::EventChannel;
-use actix_web::{web, HttpResponse};
+use crate::state::AppState;
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -39,15 +40,23 @@ pub struct GetConversationsQuery {
     pub limit: Option<i32>,
     /// Offset for pagination
     pub offset: Option<i32>,
+    /// Include archived conversations (default: false)
+    pub include_archived: Option<bool>,
 }
 
 #[utoipa::path(get, path = "/api/conversations", params(GetConversationsQuery), responses((status = 200, description = "List of conversations", body = Vec<atomic_core::ConversationWithTags>)), tag = "chat")]
 pub async fn get_conversations(db: Db, query: web::Query<GetConversationsQuery>) -> HttpResponse {
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
+    let include_archived = query.include_archived.unwrap_or(false);
     ok_or_error(
-        db.0.get_conversations(query.filter_tag_id.as_deref(), limit, offset)
-            .await,
+        db.0.get_conversations(
+            query.filter_tag_id.as_deref(),
+            limit,
+            offset,
+            include_archived,
+        )
+        .await,
     )
 }
 
@@ -146,6 +155,8 @@ pub struct SendMessageBody {
 
 #[utoipa::path(post, path = "/api/conversations/{id}/messages", params(("id" = String, Path, description = "Conversation ID")), request_body = SendMessageBody, responses((status = 200, description = "Assistant response (streaming events via WebSocket)", body = atomic_core::ChatMessageWithContext)), tag = "chat")]
 pub async fn send_chat_message(
+    req: HttpRequest,
+    state: web::Data<AppState>,
     events: EventChannel,
     db: Db,
     path: web::Path<String>,
@@ -153,7 +164,13 @@ pub async fn send_chat_message(
 ) -> HttpResponse {
     let conversation_id = path.into_inner();
     let body = body.into_inner();
-    let on_event = chat_event_callback(events.0.clone());
+    let events_tx = events.0.clone();
+    let on_event = chat_event_callback(events_tx.clone());
+
+    // Registered for the whole turn; the guard deregisters on every exit.
+    let turn = state
+        .chat_cancellations
+        .begin(job_scope(&req), &conversation_id);
 
     let result = if body.canvas_context.is_some() || body.page_context.is_some() {
         db.0.send_chat_message_with_canvas(
@@ -162,15 +179,43 @@ pub async fn send_chat_message(
             on_event,
             body.canvas_context,
             body.page_context,
+            Some(turn.flag()),
         )
         .await
     } else {
-        db.0.send_chat_message(&conversation_id, &body.content, on_event)
+        db.0.send_chat_message(&conversation_id, &body.content, on_event, Some(turn.flag()))
             .await
     };
 
     match result {
         Ok(message) => HttpResponse::Ok().json(message),
-        Err(e) => crate::error::error_response(e),
+        Err(e) => {
+            // The client watches WebSocket events during the turn and may
+            // never read this body (navigation, disconnect, a proxy timing
+            // out the long request) — put the failure on the event stream too
+            // so the conversation surfaces it either way.
+            let _ = events_tx.send(crate::state::ServerEvent::ChatError {
+                conversation_id: conversation_id.clone(),
+                error: e.to_string(),
+            });
+            crate::error::error_response(e)
+        }
     }
+}
+
+#[utoipa::path(post, path = "/api/conversations/{id}/messages/cancel", params(("id" = String, Path, description = "Conversation ID")), responses((status = 202, description = "Cancellation requested")), tag = "chat")]
+pub async fn cancel_chat_message(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let conversation_id = path.into_inner();
+    let scope = job_scope(&req);
+    // Idempotent: nothing running is a valid state to ask for a stop from,
+    // and the caller's next move (clear the streaming UI) is the same either
+    // way. `cancelled` reports whether a turn was actually signalled.
+    let cancelled = state
+        .chat_cancellations
+        .cancel(scope.as_deref(), &conversation_id);
+    HttpResponse::Accepted().json(serde_json::json!({ "cancelled": cancelled }))
 }

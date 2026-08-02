@@ -7,6 +7,7 @@ import { useContentSearch } from '../../hooks';
 import { ChatHeader } from './ChatHeader';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput } from './ChatInput';
+import { ChatContextChip } from './ChatContextChip';
 import { SearchBar } from '../ui/SearchBar';
 
 export function ChatView() {
@@ -14,10 +15,12 @@ export function ChatView() {
   const messages = useChatStore(s => s.messages);
   const isLoading = useChatStore(s => s.isLoading);
   const isStreaming = useChatStore(s => s.isStreaming);
+  const isCancelling = useChatStore(s => s.isCancelling);
   const streamingContent = useChatStore(s => s.streamingContent);
   const streamingToolCalls = useChatStore(s => s.streamingToolCalls);
   const error = useChatStore(s => s.error);
   const sendMessage = useChatStore(s => s.sendMessage);
+  const cancelResponse = useChatStore(s => s.cancelResponse);
   const goBack = useChatStore(s => s.goBack);
 
   const openReader = useUIStore(s => s.openReader);
@@ -201,6 +204,9 @@ export function ChatView() {
         <div ref={messagesEndRef} />
       </div>
 
+      {/* What the next message carries from the current page */}
+      <ChatContextChip conversationId={currentConversation.id} />
+
       {/* Input area */}
       <ChatInput
         value={inputValue}
@@ -208,6 +214,9 @@ export function ChatView() {
         onSend={handleSend}
         onKeyDown={handleKeyDown}
         disabled={isStreaming}
+        isStreaming={isStreaming}
+        isCancelling={isCancelling}
+        onStop={cancelResponse}
         placeholder={
           currentConversation.tags.length > 0
             ? `Ask about ${currentConversation.tags.map(t => t.name).join(', ')}...`

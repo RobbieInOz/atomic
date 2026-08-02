@@ -300,6 +300,10 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/conversations/{id}/messages",
         web::post().to(chat::send_chat_message),
     );
+    cfg.route(
+        "/conversations/{id}/messages/cancel",
+        web::post().to(chat::cancel_chat_message),
+    );
 
     // Ollama
     cfg.route("/ollama/test", web::post().to(ollama::test_ollama));

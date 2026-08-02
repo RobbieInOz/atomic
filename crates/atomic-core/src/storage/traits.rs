@@ -598,6 +598,8 @@ pub trait ChunkStore: Send + Sync {
 #[async_trait]
 pub trait SearchStore: Send + Sync {
     /// Perform vector similarity search using embeddings.
+    /// `scope_tag_ids` restricts results to atoms tagged with any of those tags
+    /// or their descendants (OR semantics); empty means no scope filter.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
     /// this timestamp are returned. `kinds` is non-defaulted so every caller
     /// declares whether finding atoms are in scope (the UI path passes
@@ -607,12 +609,13 @@ pub trait SearchStore: Send + Sync {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
 
     /// Perform keyword search using full-text search.
+    /// `scope_tag_ids` follows `vector_search`'s scope semantics.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
     /// this timestamp are returned. `kinds` controls the atom-kind filter; see
     /// `vector_search` for the discipline.
@@ -620,7 +623,7 @@ pub trait SearchStore: Send + Sync {
         &self,
         query: &str,
         limit: i32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
@@ -670,11 +673,13 @@ pub trait ChatStore: Send + Sync {
     ) -> StorageResult<ConversationWithTags>;
 
     /// List conversations with optional tag filter and pagination.
+    /// Archived conversations are excluded unless `include_archived`.
     async fn get_conversations(
         &self,
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>>;
 
     /// Get a conversation with its full message history.

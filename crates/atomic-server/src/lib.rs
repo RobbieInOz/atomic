@@ -119,6 +119,7 @@ use utoipa::OpenApi;
         routes::chat::add_tag_to_scope,
         routes::chat::remove_tag_from_scope,
         routes::chat::send_chat_message,
+        routes::chat::cancel_chat_message,
         // Providers
         routes::ollama::test_ollama,
         routes::ollama::get_ollama_models,

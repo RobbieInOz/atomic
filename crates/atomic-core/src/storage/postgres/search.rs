@@ -29,7 +29,7 @@ impl PostgresStorage {
             .keyword_search(
                 query_trimmed,
                 section_limit,
-                None,
+                &[],
                 None,
                 &crate::models::KindFilter::All,
             )
@@ -57,7 +57,7 @@ impl SearchStore for PostgresStorage {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
@@ -108,7 +108,9 @@ impl SearchStore for PostgresStorage {
             .collect();
 
         // Scope filtering by tag if specified
-        let scope_atom_ids: std::collections::HashSet<String> = if let Some(tid) = tag_id {
+        let scope_atom_ids: std::collections::HashSet<String> = if scope_tag_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
             let candidate_atom_ids: Vec<&str> = filtered
                 .iter()
                 .map(|(_, aid, _, _, _)| aid.as_str())
@@ -116,12 +118,10 @@ impl SearchStore for PostgresStorage {
             pg_batch_atoms_with_scope_tags(
                 &self.pool,
                 &candidate_atom_ids,
-                &[tid.to_string()],
+                scope_tag_ids,
                 &self.db_id,
             )
             .await?
-        } else {
-            std::collections::HashSet::new()
         };
         // Kind filtering. `None` = `KindFilter::All` (no filter applied).
         let kind_allowed: Option<std::collections::HashSet<String>> =
@@ -146,7 +146,7 @@ impl SearchStore for PostgresStorage {
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();
         for (_chunk_id, atom_id, content, chunk_index, similarity) in &filtered {
-            if tag_id.is_some() && !scope_atom_ids.contains(atom_id) {
+            if !scope_tag_ids.is_empty() && !scope_atom_ids.contains(atom_id) {
                 continue;
             }
             if let Some(ref allowed) = kind_allowed {
@@ -206,7 +206,7 @@ impl SearchStore for PostgresStorage {
         &self,
         query: &str,
         limit: i32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
@@ -253,21 +253,21 @@ impl SearchStore for PostgresStorage {
         .map_err(|e| AtomicCoreError::Search(format!("Keyword search failed: {}", e)))?;
 
         // Apply tag scope filter if specified
-        let filtered = if let Some(tid) = tag_id {
+        let filtered = if scope_tag_ids.is_empty() {
+            rows
+        } else {
             let candidate_atom_ids: Vec<&str> =
                 rows.iter().map(|(_, aid, _, _, _)| aid.as_str()).collect();
             let matching = pg_batch_atoms_with_scope_tags(
                 &self.pool,
                 &candidate_atom_ids,
-                &[tid.to_string()],
+                scope_tag_ids,
                 &self.db_id,
             )
             .await?;
             rows.into_iter()
                 .filter(|(_, aid, _, _, _)| matching.contains(aid.as_str()))
                 .collect()
-        } else {
-            rows
         };
 
         // Apply kind filter post-pass (FTS index is kind-agnostic).

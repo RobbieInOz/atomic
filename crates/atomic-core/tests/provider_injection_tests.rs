@@ -269,6 +269,7 @@ async fn explicit_config_pins_per_task_models_sqlite() {
         &conversation.conversation.id,
         "what do my notes say about explicit configs?",
         |_| {},
+        None,
     )
     .await
     .expect("chat through the explicit config");

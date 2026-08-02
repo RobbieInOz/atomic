@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { ChevronLeft } from 'lucide-react';
+import { Archive, ArchiveRestore, ChevronLeft, MoreVertical } from 'lucide-react';
 import { ConversationWithTags, useChatStore } from '../../stores/chat';
+import { ContextMenu } from '../ui/ContextMenu';
 import { ScopeEditor } from './ScopeEditor';
 
 interface ChatHeaderProps {
@@ -11,7 +12,9 @@ interface ChatHeaderProps {
 export function ChatHeader({ conversation, onBack }: ChatHeaderProps) {
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editedTitle, setEditedTitle] = useState(conversation.title || '');
+  const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const updateConversationTitle = useChatStore(s => s.updateConversationTitle);
+  const setConversationArchived = useChatStore(s => s.setConversationArchived);
 
   const handleTitleSave = async () => {
     if (editedTitle.trim() !== conversation.title) {
@@ -28,6 +31,27 @@ export function ChatHeader({ conversation, onBack }: ChatHeaderProps) {
       setIsEditingTitle(false);
     }
   };
+
+  const handleArchive = async () => {
+    await setConversationArchived(conversation.id, !conversation.is_archived);
+    // Archiving hides the conversation from the default list; staying in it
+    // would leave the user in a view they can't navigate back to.
+    if (!conversation.is_archived) {
+      onBack();
+    }
+  };
+
+  const menuItems = [
+    {
+      label: conversation.is_archived ? 'Unarchive' : 'Archive',
+      onClick: handleArchive,
+      icon: conversation.is_archived ? (
+        <ArchiveRestore className="w-4 h-4" strokeWidth={2} />
+      ) : (
+        <Archive className="w-4 h-4" strokeWidth={2} />
+      ),
+    },
+  ];
 
   return (
     <div className="flex-shrink-0 border-b border-[var(--color-border)]">
@@ -67,7 +91,25 @@ export function ChatHeader({ conversation, onBack }: ChatHeaderProps) {
             {conversation.title || 'New Conversation'}
           </h2>
         )}
+
+        <button
+          onClick={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            setMenuPosition({ x: rect.right - 160, y: rect.bottom + 4 });
+          }}
+          className="p-1.5 text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] rounded transition-colors"
+          aria-label="Conversation actions"
+        >
+          <MoreVertical className="w-4 h-4" strokeWidth={2} />
+        </button>
       </div>
+
+      <ContextMenu
+        items={menuItems}
+        position={menuPosition}
+        onClose={() => setMenuPosition(null)}
+        autoFocus
+      />
 
       {/* Scope editor row */}
       <div className="px-4 pb-3">

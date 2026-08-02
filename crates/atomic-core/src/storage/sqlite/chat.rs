@@ -24,9 +24,10 @@ impl SqliteStorage {
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>> {
         let conn = self.db.read_conn()?;
-        crate::chat::get_conversations(&conn, filter_tag_id, limit, offset)
+        crate::chat::get_conversations(&conn, filter_tag_id, limit, offset, include_archived)
     }
 
     pub(crate) fn get_conversation_sync(
@@ -201,11 +202,17 @@ impl ChatStore for SqliteStorage {
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>> {
         let storage = self.clone();
         let filter_tag_id = filter_tag_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            storage.get_conversations_sync(filter_tag_id.as_deref(), limit, offset)
+            storage.get_conversations_sync(
+                filter_tag_id.as_deref(),
+                limit,
+                offset,
+                include_archived,
+            )
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?

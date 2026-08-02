@@ -15,7 +15,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -95,6 +95,18 @@ struct MockAiCounters {
     /// failure) is held for this long before being sent — latency injection
     /// for tests that need requests to genuinely overlap in flight.
     chat_delay: Mutex<Option<std::time::Duration>>,
+    /// When true, a streaming request that offers tools always answers with
+    /// another tool call instead of wrapping up — a model that never stops
+    /// researching, which is how tests reach the agent loop's iteration cap.
+    chat_force_tool_calls: AtomicBool,
+    /// Conversation-title requests seen so far. Counted separately from
+    /// `chat_requests` because title generation is fire-and-forget: a test
+    /// waits on this to know the detached task actually ran.
+    title_requests: AtomicUsize,
+    /// When set, conversation-title requests serve this failure instead of a
+    /// title. Scoped to titles so the exchange that triggers one still
+    /// succeeds.
+    title_failure: Mutex<Option<InjectedFailure>>,
 }
 
 impl MockAiServer {
@@ -178,9 +190,36 @@ impl MockAiServer {
         *self.counters.chat_delay.lock().expect("chat_delay lock") = delay;
     }
 
+    /// Make every tool-bearing streaming request answer with another tool
+    /// call, so an agent loop runs until its own iteration cap stops it. A
+    /// request that offers no tools still answers with text — there is no
+    /// valid tool call to make.
+    pub fn set_chat_force_tool_calls(&self, force: bool) {
+        self.counters
+            .chat_force_tool_calls
+            .store(force, Ordering::Relaxed);
+    }
+
+    /// Conversation-title completions requested so far. Zero means the
+    /// detached title task never reached the provider.
+    pub fn title_request_count(&self) -> usize {
+        self.counters.title_requests.load(Ordering::Relaxed)
+    }
+
+    /// Make conversation-title requests fail with `failure` until cleared
+    /// with `None`. Requests are still counted while failing.
+    pub fn set_title_failure(&self, failure: Option<InjectedFailure>) {
+        *self
+            .counters
+            .title_failure
+            .lock()
+            .expect("title_failure lock") = failure;
+    }
+
     pub fn reset_counts(&self) {
         self.counters.embedding_requests.store(0, Ordering::Relaxed);
         self.counters.chat_requests.store(0, Ordering::Relaxed);
+        self.counters.title_requests.store(0, Ordering::Relaxed);
         self.counters
             .chat_models
             .lock()
@@ -228,13 +267,16 @@ fn embed_text(text: &str) -> Vec<f32> {
 /// - First turn: a single `tool_calls` delta requesting `search_atoms` with
 ///   a query plucked from the most recent user message. Closes with
 ///   `finish_reason: tool_calls`.
-/// - Tool results present: a single content delta with deterministic text,
-///   closes with `finish_reason: stop`.
+/// - Tool results present, or no tools offered at all: content deltas with
+///   deterministic text, closing with `finish_reason: stop`.
+///
+/// `force_tool_calls` keeps a tool-bearing request on the tool-call leg
+/// forever (see [`MockAiServer::set_chat_force_tool_calls`]).
 ///
 /// The provider parser is line-oriented (`data: ...\n`) and accepts the
 /// stream as a single body payload, so we don't need true chunked transfer
 /// to satisfy it.
-fn streaming_chat_response(body: &Value) -> ResponseTemplate {
+fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemplate {
     let has_tool_results = body
         .get("messages")
         .and_then(|v| v.as_array())
@@ -243,13 +285,29 @@ fn streaming_chat_response(body: &Value) -> ResponseTemplate {
                 .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
         })
         .unwrap_or(false);
+    let tools_offered = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false);
+    // Without tools on the request there is nothing to call, so the only
+    // honest answer is prose — that's the shape of the agent loop's
+    // no-tools salvage call.
+    let answer_with_text = !tools_offered || (has_tool_results && !force_tool_calls);
 
-    let sse_body = if has_tool_results {
-        // Second leg: agent has tool results, emit final assistant text.
+    let sse_body = if answer_with_text {
+        // Final leg: emit the assistant text. Split across two deltas so
+        // tests exercise incremental streaming rather than one-shot content.
         let chunks = [
             json!({
                 "choices": [{
-                    "delta": { "content": "Mock assistant reply grounded in the search results." },
+                    "delta": { "content": "Mock assistant reply " },
+                    "finish_reason": null,
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "content": "grounded in the search results." },
                     "finish_reason": null,
                 }]
             }),
@@ -454,13 +512,10 @@ impl Respond for ChatResponder {
                 .push(model.to_string());
         }
 
-        // Streaming chat (agent loop). Detected by `stream: true` plus a
-        // `tools` array — the chat agent always sends tools, while wiki /
+        // Streaming chat (agent loop). `stream: true` is answered with SSE
+        // whatever else the request carries — see `streaming_chat_response`
+        // for how it picks between a tool call and final text. Wiki and
         // tagging only stream when explicitly enabled (they don't, today).
-        // Branch on whether the message log already contains tool results:
-        //   - no tool results yet → emit a tool_calls SSE that requests
-        //     `search_atoms`.
-        //   - tool results present → emit a final text-content SSE.
         let is_streaming = body
             .get("stream")
             .and_then(|v| v.as_bool())
@@ -470,8 +525,9 @@ impl Respond for ChatResponder {
             .and_then(|v| v.as_array())
             .map(|t| !t.is_empty())
             .unwrap_or(false);
-        if is_streaming && has_tools {
-            return with_delay(streaming_chat_response(&body));
+        if is_streaming {
+            let force = self.counters.chat_force_tool_calls.load(Ordering::Relaxed);
+            return with_delay(streaming_chat_response(&body, force));
         }
 
         // Non-streaming chat with tools — used by the reports agentic loop.
@@ -517,6 +573,31 @@ impl Respond for ChatResponder {
             .pointer("/response_format/json_schema/name")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+
+        // Conversation titles: a plain completion whose system prompt asks
+        // for "a conversation title". The answer is deliberately decorated
+        // (wrapping quotes, trailing period) so tests see the caller's
+        // sanitizer do its job rather than a pre-cleaned string.
+        if request_text.contains("conversation title") {
+            self.counters.title_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(failure) = *self
+                .counters
+                .title_failure
+                .lock()
+                .expect("title_failure lock")
+            {
+                return with_delay(failure.response());
+            }
+            return with_delay(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "mock-cmpl",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "\"Notes About Pelicans.\"" },
+                    "finish_reason": "stop",
+                }],
+            })));
+        }
 
         if wire_schema.is_none() && request_text.contains("citations_used:") {
             if request_text.contains("wikifail") {

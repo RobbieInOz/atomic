@@ -16,7 +16,7 @@ impl SqliteStorage {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
@@ -38,11 +38,10 @@ impl SqliteStorage {
         let chunk_map = batch_fetch_chunk_info(&conn, &chunk_ids)?;
 
         // Scope filtering
-        let scope_tag_ids: Vec<String> = tag_id.map(|t| vec![t.to_string()]).unwrap_or_default();
         let scope_atom_ids: std::collections::HashSet<String> = if !scope_tag_ids.is_empty() {
             let candidate_atom_ids: Vec<&str> =
                 chunk_map.values().map(|(aid, _, _)| aid.as_str()).collect();
-            batch_atoms_with_scope_tags(&conn, &candidate_atom_ids, &scope_tag_ids)?
+            batch_atoms_with_scope_tags(&conn, &candidate_atom_ids, scope_tag_ids)?
         } else {
             std::collections::HashSet::new()
         };
@@ -126,7 +125,7 @@ impl SqliteStorage {
         &self,
         query: &str,
         limit: i32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
@@ -145,16 +144,15 @@ impl SqliteStorage {
             atom_fts_search_with_cutoff(&conn, &escaped_query, fetch_limit, created_after)?;
 
         // Apply tag scope filter if specified
-        let filtered = if let Some(tid) = tag_id {
-            let scope_tag_ids = vec![tid.to_string()];
+        let filtered = if scope_tag_ids.is_empty() {
+            raw_results
+        } else {
             let candidate_atom_ids: Vec<&str> = raw_results.iter().map(|r| r.0.as_str()).collect();
-            let matching = batch_atoms_with_scope_tags(&conn, &candidate_atom_ids, &scope_tag_ids)?;
+            let matching = batch_atoms_with_scope_tags(&conn, &candidate_atom_ids, scope_tag_ids)?;
             raw_results
                 .into_iter()
                 .filter(|r| matching.contains(r.0.as_str()))
                 .collect::<Vec<_>>()
-        } else {
-            raw_results
         };
 
         // Apply kind filter post-pass (FTS index is kind-agnostic).
@@ -377,7 +375,7 @@ impl SqliteStorage {
         let atoms = self.keyword_search_sync(
             query,
             section_limit,
-            None,
+            &[],
             None,
             &crate::models::KindFilter::All,
         )?;
@@ -401,13 +399,13 @@ impl SearchStore for SqliteStorage {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let storage = self.clone();
         let query_embedding = query_embedding.to_vec();
-        let tag_id = tag_id.map(|s| s.to_string());
+        let scope_tag_ids = scope_tag_ids.to_vec();
         let created_after = created_after.map(|s| s.to_string());
         let kinds = kinds.clone();
         tokio::task::spawn_blocking(move || {
@@ -415,7 +413,7 @@ impl SearchStore for SqliteStorage {
                 &query_embedding,
                 limit,
                 threshold,
-                tag_id.as_deref(),
+                &scope_tag_ids,
                 created_after.as_deref(),
                 &kinds,
             )
@@ -428,20 +426,20 @@ impl SearchStore for SqliteStorage {
         &self,
         query: &str,
         limit: i32,
-        tag_id: Option<&str>,
+        scope_tag_ids: &[String],
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let storage = self.clone();
         let query = query.to_string();
-        let tag_id = tag_id.map(|s| s.to_string());
+        let scope_tag_ids = scope_tag_ids.to_vec();
         let created_after = created_after.map(|s| s.to_string());
         let kinds = kinds.clone();
         tokio::task::spawn_blocking(move || {
             storage.keyword_search_sync(
                 &query,
                 limit,
-                tag_id.as_deref(),
+                &scope_tag_ids,
                 created_after.as_deref(),
                 &kinds,
             )

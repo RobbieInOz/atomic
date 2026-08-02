@@ -513,6 +513,7 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
       if (a.filterTagId) params.set('filter_tag_id', a.filterTagId as string);
       if (a.limit != null) params.set('limit', String(a.limit));
       if (a.offset != null) params.set('offset', String(a.offset));
+      if (a.includeArchived) params.set('include_archived', 'true');
       const qs = params.toString();
       return `/api/conversations${qs ? `?${qs}` : ''}`;
     },
@@ -556,6 +557,11 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
       ...(a.canvasContext ? { canvas_context: a.canvasContext } : {}),
       ...(a.pageContext ? { page_context: a.pageContext } : {}),
     }),
+  },
+  cancel_chat_message: {
+    method: 'POST',
+    path: (a) =>
+      `/api/conversations/${encodeURIComponent(a.conversationId as string)}/messages/cancel`,
   },
 
   // ==================== Ollama ====================

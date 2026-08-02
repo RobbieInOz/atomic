@@ -417,46 +417,53 @@ pub fn create_conversation(
     })
 }
 
-/// Get all conversations, optionally filtered by tag
+/// Get all conversations, optionally filtered by tag. Archived conversations
+/// are hidden unless `include_archived` — the comparison against
+/// `max_archived` keeps both cases on one query shape.
 pub fn get_conversations(
     conn: &Connection,
     filter_tag_id: Option<&str>,
     limit: i32,
     offset: i32,
+    include_archived: bool,
 ) -> Result<Vec<ConversationWithTags>, AtomicCoreError> {
+    let max_archived = i32::from(include_archived);
     let conversations: Vec<Conversation> = if let Some(tag_id) = filter_tag_id {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at, c.is_archived
              FROM conversations c
              JOIN conversation_tags ct ON ct.conversation_id = c.id
-             WHERE ct.tag_id = ?1 AND c.is_archived = 0
+             WHERE ct.tag_id = ?1 AND c.is_archived <= ?4
              ORDER BY c.updated_at DESC
              LIMIT ?2 OFFSET ?3",
         )?;
 
         let results = stmt
-            .query_map(rusqlite::params![tag_id, limit, offset], |row| {
-                Ok(Conversation {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    is_archived: row.get::<_, i32>(4)? != 0,
-                })
-            })?
+            .query_map(
+                rusqlite::params![tag_id, limit, offset, max_archived],
+                |row| {
+                    Ok(Conversation {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        is_archived: row.get::<_, i32>(4)? != 0,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         results
     } else {
         let mut stmt = conn.prepare(
             "SELECT id, title, created_at, updated_at, is_archived
              FROM conversations
-             WHERE is_archived = 0
+             WHERE is_archived <= ?3
              ORDER BY updated_at DESC
              LIMIT ?1 OFFSET ?2",
         )?;
 
         let results = stmt
-            .query_map(rusqlite::params![limit, offset], |row| {
+            .query_map(rusqlite::params![limit, offset, max_archived], |row| {
                 Ok(Conversation {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -960,8 +967,28 @@ mod tests {
         create_conversation(&conn, &[], Some("Chat 1")).unwrap();
         create_conversation(&conn, &[], Some("Chat 2")).unwrap();
 
-        let conversations = get_conversations(&conn, None, 10, 0).unwrap();
+        let conversations = get_conversations(&conn, None, 10, 0, false).unwrap();
         assert_eq!(conversations.len(), 2);
+    }
+
+    #[test]
+    fn test_get_conversations_archive_visibility() {
+        let (db, _temp) = setup_db();
+        let conn = db.conn.lock().unwrap();
+
+        let kept = create_conversation(&conn, &[], Some("Kept")).unwrap();
+        let archived = create_conversation(&conn, &[], Some("Archived")).unwrap();
+        update_conversation(&conn, &archived.conversation.id, None, Some(true)).unwrap();
+
+        let visible = get_conversations(&conn, None, 10, 0, false).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].conversation.id, kept.conversation.id);
+
+        let all = get_conversations(&conn, None, 10, 0, true).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .any(|c| c.conversation.id == archived.conversation.id && c.conversation.is_archived));
     }
 
     #[test]
@@ -1093,7 +1120,7 @@ mod tests {
         .unwrap();
 
         // Must not panic.
-        let conversations = get_conversations(&conn, None, 10, 0).unwrap();
+        let conversations = get_conversations(&conn, None, 10, 0, false).unwrap();
         assert_eq!(conversations.len(), 1);
         let preview = conversations[0]
             .last_message_preview

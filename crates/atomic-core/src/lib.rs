@@ -32,6 +32,7 @@ pub mod atom_edit;
 pub(crate) mod atom_links;
 pub mod canvas_level;
 pub mod chat;
+mod chat_title;
 pub mod chunking;
 pub mod clustering;
 pub mod compaction;
@@ -61,7 +62,7 @@ pub mod tokens;
 pub mod wiki;
 
 // Re-exports for convenience
-pub use agent::{CanvasClusterSummary, CanvasContext, ChatEvent, PageContext};
+pub use agent::{CanvasClusterSummary, CanvasContext, ChatCancel, ChatEvent, PageContext};
 pub use atom_edit::{apply_atom_edits, AtomEditOperation};
 pub use db::Database;
 pub use embedding::{EmbeddingEvent, EmbeddingStrategy, TaggingStrategy};
@@ -1780,7 +1781,7 @@ impl AtomicCore {
         // Postgres path: use storage dispatch methods directly
         let settings = self.settings_for_ai().await?;
         let config = providers::ProviderConfig::from_settings(&settings);
-        let tag_id = options.scope_tag_ids.first().map(|s| s.as_str());
+        let scope_tag_ids = options.scope_tag_ids.as_slice();
         let cutoff = options.since_days.map(search::since_days_cutoff);
         let cutoff_ref = cutoff.as_deref();
 
@@ -1790,7 +1791,7 @@ impl AtomicCore {
                     .keyword_search_sync(
                         &options.query,
                         options.limit,
-                        tag_id,
+                        scope_tag_ids,
                         cutoff_ref,
                         &options.kinds,
                     )
@@ -1813,7 +1814,7 @@ impl AtomicCore {
                         &embeddings[0],
                         options.limit,
                         options.threshold,
-                        tag_id,
+                        scope_tag_ids,
                         cutoff_ref,
                         &options.kinds,
                     )
@@ -1834,7 +1835,7 @@ impl AtomicCore {
                     .keyword_search_sync(
                         &options.query,
                         options.limit * 2,
-                        tag_id,
+                        scope_tag_ids,
                         cutoff_ref,
                         &options.kinds,
                     )
@@ -1846,7 +1847,7 @@ impl AtomicCore {
                             &embeddings[0],
                             options.limit * 2,
                             options.threshold,
-                            tag_id,
+                            scope_tag_ids,
                             cutoff_ref,
                             &options.kinds,
                         )
@@ -3115,15 +3116,17 @@ impl AtomicCore {
         self.storage.create_conversation_sync(tag_ids, title).await
     }
 
-    /// Get all conversations, optionally filtered by tag
+    /// Get all conversations, optionally filtered by tag. Archived
+    /// conversations are excluded unless `include_archived`.
     pub async fn get_conversations(
         &self,
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> Result<Vec<ConversationWithTags>, AtomicCoreError> {
         self.storage
-            .get_conversations_sync(filter_tag_id, limit, offset)
+            .get_conversations_sync(filter_tag_id, limit, offset, include_archived)
             .await
     }
 
@@ -3188,12 +3191,15 @@ impl AtomicCore {
     /// Send a chat message and run the agent loop.
     ///
     /// The `on_event` callback receives streaming deltas, tool call events,
-    /// and completion/error events during the agent loop.
+    /// and completion/error events during the agent loop. `cancel` is an
+    /// optional flag the host can raise to stop the turn early (see
+    /// [`ChatCancel`]); the partial answer is still persisted and returned.
     pub async fn send_chat_message<F>(
         &self,
         conversation_id: &str,
         content: &str,
         on_event: F,
+        cancel: Option<ChatCancel>,
     ) -> Result<ChatMessageWithContext, AtomicCoreError>
     where
         F: Fn(ChatEvent) + Send + Sync + 'static,
@@ -3205,12 +3211,14 @@ impl AtomicCore {
             on_event,
             self.settings_for_background().await,
             self.inline_pipeline(),
+            cancel,
         )
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e))
     }
 
     /// Send a chat message with optional UI context for page-aware and canvas-aware tools.
+    #[allow(clippy::too_many_arguments)] // Public chat entry; each argument is a distinct context channel.
     pub async fn send_chat_message_with_canvas<F>(
         &self,
         conversation_id: &str,
@@ -3218,6 +3226,7 @@ impl AtomicCore {
         on_event: F,
         canvas_context: Option<CanvasContext>,
         page_context: Option<PageContext>,
+        cancel: Option<ChatCancel>,
     ) -> Result<ChatMessageWithContext, AtomicCoreError>
     where
         F: Fn(ChatEvent) + Send + Sync + 'static,
@@ -3232,6 +3241,7 @@ impl AtomicCore {
             canvas_context,
             page_context,
             Some(self.canvas_cache.clone()),
+            cancel,
         )
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e))
@@ -5379,6 +5389,21 @@ mod tests {
                 ..Default::default()
             },
             |_| {}, // no-op callback
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Test utility: create an atom already assigned to `tag_id`.
+    async fn create_tagged_atom(db: &AtomicCore, content: &str, tag_id: &str) -> AtomWithTags {
+        db.create_atom(
+            CreateAtomRequest {
+                content: content.to_string(),
+                tag_ids: vec![tag_id.to_string()],
+                ..Default::default()
+            },
+            |_| {},
         )
         .await
         .unwrap()
@@ -9857,7 +9882,7 @@ mod tests {
             .keyword_search_sync(
                 "elephants",
                 10,
-                None,
+                &[],
                 None,
                 &models::KindFilter::only(models::AtomKind::Captured),
             )
@@ -9872,7 +9897,7 @@ mod tests {
 
         let all = db
             .storage
-            .keyword_search_sync("elephants", 10, None, None, &models::KindFilter::All)
+            .keyword_search_sync("elephants", 10, &[], None, &models::KindFilter::All)
             .await
             .unwrap();
         let all_ids: std::collections::HashSet<_> =
@@ -9881,6 +9906,59 @@ mod tests {
             all_ids.contains(&captured.atom.id) && all_ids.contains(&finding.atom.id),
             "KindFilter::All returns both kinds"
         );
+    }
+
+    #[tokio::test]
+    async fn keyword_search_honors_every_scope_tag() {
+        // Chat scopes a conversation to N tags and expects OR semantics across
+        // all of them. The search stores take the full list precisely so no
+        // backend can quietly honor only the first one (the Postgres path used
+        // to pass `scope_tag_ids.first()`); this pins the contract on the
+        // SQLite path, which shares the scope helper's OR-with-descendants SQL
+        // with Postgres.
+        let (db, _temp) = create_test_db().await;
+        let topics = get_seeded_tag(&db, "Topics");
+        let rust = db
+            .create_tag("Rust", Some(&topics.id))
+            .await
+            .expect("create Rust tag");
+        let sailing = db
+            .create_tag("Sailing", Some(&topics.id))
+            .await
+            .expect("create Sailing tag");
+
+        let rust_atom = create_tagged_atom(&db, "pelicans compile fast", &rust.id).await;
+        let sailing_atom = create_tagged_atom(&db, "pelicans sail south", &sailing.id).await;
+        let untagged_atom = create_test_atom(&db, "pelicans wander off").await;
+
+        let scoped = db
+            .storage
+            .keyword_search_sync(
+                "pelicans",
+                10,
+                &[rust.id.clone(), sailing.id.clone()],
+                None,
+                &models::KindFilter::All,
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            scoped.iter().map(|r| r.atom.atom.id.clone()).collect();
+        assert!(
+            ids.contains(&rust_atom.atom.id) && ids.contains(&sailing_atom.atom.id),
+            "every scope tag contributes results, not just the first"
+        );
+        assert!(
+            !ids.contains(&untagged_atom.atom.id),
+            "atoms outside the scope stay out"
+        );
+
+        let unscoped = db
+            .storage
+            .keyword_search_sync("pelicans", 10, &[], None, &models::KindFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(unscoped.len(), 3, "an empty scope filters nothing");
     }
 
     #[tokio::test]

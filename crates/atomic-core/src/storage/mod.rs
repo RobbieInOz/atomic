@@ -519,9 +519,9 @@ dispatch! {
         => sqlite: rearm_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: rearm_pipeline_jobs;
 
     // ---- SearchStore ----
-    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: vector_search_sync, pg_trait: SearchStore, pg_method: vector_search;
-    fn keyword_search_sync(&self, query: &str, limit: i32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn keyword_search_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_sync, pg_trait: SearchStore, pg_method: keyword_search;
     fn find_similar_sync(&self, atom_id: &str, limit: i32, threshold: f32) -> Result<Vec<SimilarAtomResult>, AtomicCoreError>
         => sqlite: find_similar_sync, pg_trait: SearchStore, pg_method: find_similar;
@@ -533,7 +533,7 @@ dispatch! {
     // ---- ChatStore ----
     fn create_conversation_sync(&self, tag_ids: &[String], title: Option<&str>) -> Result<ConversationWithTags, AtomicCoreError>
         => sqlite: create_conversation_sync, pg_trait: ChatStore, pg_method: create_conversation;
-    fn get_conversations_sync(&self, filter_tag_id: Option<&str>, limit: i32, offset: i32) -> Result<Vec<ConversationWithTags>, AtomicCoreError>
+    fn get_conversations_sync(&self, filter_tag_id: Option<&str>, limit: i32, offset: i32, include_archived: bool) -> Result<Vec<ConversationWithTags>, AtomicCoreError>
         => sqlite: get_conversations_sync, pg_trait: ChatStore, pg_method: get_conversations;
     fn get_conversation_sync(&self, conversation_id: &str) -> Result<Option<ConversationWithMessages>, AtomicCoreError>
         => sqlite: get_conversation_sync, pg_trait: ChatStore, pg_method: get_conversation;

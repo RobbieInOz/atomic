@@ -73,10 +73,10 @@ Fresh databases seed these defaults:
 | Setting | Default |
 |---------|---------|
 | `provider` | `openrouter` |
-| `embedding_model` | `openai/text-embedding-3-small` |
-| `tagging_model` | `openai/gpt-4o-mini` |
-| `wiki_model` | `anthropic/claude-sonnet-4.6` |
-| `chat_model` | `anthropic/claude-sonnet-4.6` |
+| `embedding_model` | `qwen/qwen3-embedding-8b` |
+| `tagging_model` | `openai/gpt-5-nano` |
+| `wiki_model` | `anthropic/claude-sonnet-5` |
+| `chat_model` | `anthropic/claude-sonnet-5` |
 | `ollama_host` | `http://127.0.0.1:11434` |
 | `ollama_embedding_model` | `nomic-embed-text` |
 | `ollama_llm_model` | `llama3.2` |
