@@ -536,13 +536,13 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'PUT',
     path: (a) => `/api/conversations/${encodeURIComponent(a.conversationId as string)}/scope`,
     argsMode: 'body',
-    transformArgs: (a) => ({ tag_ids: a.tagIds }),
+    transformArgs: (a) => ({ tag_ids: a.entries }),
   },
   add_tag_to_scope: {
     method: 'POST',
     path: (a) => `/api/conversations/${encodeURIComponent(a.conversationId as string)}/scope/tags`,
     argsMode: 'body',
-    transformArgs: (a) => ({ tag_id: a.tagId }),
+    transformArgs: (a) => ({ tag_id: a.tagId, mode: a.mode ?? 'include' }),
   },
   remove_tag_from_scope: {
     method: 'DELETE',

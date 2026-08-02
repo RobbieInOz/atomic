@@ -13,6 +13,7 @@ use crate::compaction::{CompactionResult, TagMerge};
 use crate::error::AtomicCoreError;
 use crate::models::AtomCluster;
 use crate::models::*;
+use crate::search::ScopeFilter;
 use crate::{CreateAtomRequest, ListAtomsParams, UpdateAtomRequest};
 
 /// Result type alias for storage operations.
@@ -598,8 +599,9 @@ pub trait ChunkStore: Send + Sync {
 #[async_trait]
 pub trait SearchStore: Send + Sync {
     /// Perform vector similarity search using embeddings.
-    /// `scope_tag_ids` restricts results to atoms tagged with any of those tags
-    /// or their descendants (OR semantics); empty means no scope filter.
+    /// `scope` restricts results to atoms satisfying its include/require/exclude
+    /// lists (see [`crate::search::ScopeFilter`]); an empty filter means no
+    /// scope filtering.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
     /// this timestamp are returned. `kinds` is non-defaulted so every caller
     /// declares whether finding atoms are in scope (the UI path passes
@@ -609,13 +611,13 @@ pub trait SearchStore: Send + Sync {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        scope_tag_ids: &[String],
+        scope: &ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
 
     /// Perform keyword search using full-text search.
-    /// `scope_tag_ids` follows `vector_search`'s scope semantics.
+    /// `scope` follows `vector_search`'s scope semantics.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
     /// this timestamp are returned. `kinds` controls the atom-kind filter; see
     /// `vector_search` for the discipline.
@@ -623,7 +625,7 @@ pub trait SearchStore: Send + Sync {
         &self,
         query: &str,
         limit: i32,
-        scope_tag_ids: &[String],
+        scope: &ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
@@ -642,7 +644,7 @@ pub trait SearchStore: Send + Sync {
         &self,
         query: &str,
         limit: i32,
-        scope_tag_ids: &[String],
+        scope: &ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
@@ -654,7 +656,7 @@ pub trait SearchStore: Send + Sync {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        scope_tag_ids: &[String],
+        scope: &ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
@@ -703,14 +705,16 @@ pub trait ChatStore: Send + Sync {
     async fn set_conversation_scope(
         &self,
         conversation_id: &str,
-        tag_ids: &[String],
+        entries: &[ScopeEntry],
     ) -> StorageResult<ConversationWithTags>;
 
-    /// Add a tag to a conversation's scope.
+    /// Put a tag in a conversation's scope under `mode`. A tag already in
+    /// scope changes mode rather than erroring.
     async fn add_tag_to_scope(
         &self,
         conversation_id: &str,
         tag_id: &str,
+        mode: ScopeMode,
     ) -> StorageResult<ConversationWithTags>;
 
     /// Remove a tag from a conversation's scope.
@@ -742,11 +746,11 @@ pub trait ChatStore: Send + Sync {
         citations: &[ChatCitation],
     ) -> StorageResult<()>;
 
-    /// Get the tag IDs that scope a conversation.
-    async fn get_scope_tag_ids(&self, conversation_id: &str) -> StorageResult<Vec<String>>;
+    /// Get the retrieval scope for a conversation.
+    async fn get_conversation_scope(&self, conversation_id: &str) -> StorageResult<ScopeFilter>;
 
     /// Get a human-readable scope description for the system prompt.
-    async fn get_scope_description(&self, tag_ids: &[String]) -> StorageResult<String>;
+    async fn get_scope_description(&self, scope: &ScopeFilter) -> StorageResult<String>;
 }
 
 // ==================== Wiki Storage ====================

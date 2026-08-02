@@ -221,7 +221,7 @@ macro_rules! impl_spawn_arg_copy {
         )*
     };
 }
-impl_spawn_arg_copy!(i32, usize, f32, bool, Option<i32>, Option<bool>);
+impl_spawn_arg_copy!(i32, usize, f32, bool, Option<i32>, Option<bool>, ScopeMode);
 
 // ---- ReborrowArg impls ----
 
@@ -270,7 +270,7 @@ macro_rules! impl_reborrow_copy {
         )*
     };
 }
-impl_reborrow_copy!(i32, usize, f32, bool, Option<i32>, Option<bool>);
+impl_reborrow_copy!(i32, usize, f32, bool, Option<i32>, Option<bool>, ScopeMode);
 
 // Struct types: sync method takes `&Struct`, owned is `Struct`, reborrow is `&Struct`.
 macro_rules! impl_reborrow_struct {
@@ -294,6 +294,7 @@ impl_reborrow_struct!(
     crate::models::CreateReportRequest,
     crate::models::UpdateReportRequest,
     crate::models::ReportFinding,
+    crate::search::ScopeFilter,
 );
 
 /// Macro to generate async dispatch methods. For each method:
@@ -519,15 +520,15 @@ dispatch! {
         => sqlite: rearm_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: rearm_pipeline_jobs;
 
     // ---- SearchStore ----
-    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope: &crate::search::ScopeFilter, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: vector_search_sync, pg_trait: SearchStore, pg_method: vector_search;
-    fn keyword_search_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn keyword_search_sync(&self, query: &str, limit: i32, scope: &crate::search::ScopeFilter, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_sync, pg_trait: SearchStore, pg_method: keyword_search;
     fn find_similar_sync(&self, atom_id: &str, limit: i32, threshold: f32) -> Result<Vec<SimilarAtomResult>, AtomicCoreError>
         => sqlite: find_similar_sync, pg_trait: SearchStore, pg_method: find_similar;
-    fn keyword_search_chunks_sync(&self, query: &str, limit: i32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
+    fn keyword_search_chunks_sync(&self, query: &str, limit: i32, scope: &crate::search::ScopeFilter, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_chunks_sync, pg_trait: SearchStore, pg_method: keyword_search_chunks;
-    fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope_tag_ids: &[String], created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
+    fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope: &crate::search::ScopeFilter, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: vector_search_chunks_sync, pg_trait: SearchStore, pg_method: vector_search_chunks;
 
     // ---- ChatStore ----
@@ -541,9 +542,9 @@ dispatch! {
         => sqlite: update_conversation_sync, pg_trait: ChatStore, pg_method: update_conversation;
     fn delete_conversation_sync(&self, id: &str) -> Result<(), AtomicCoreError>
         => sqlite: delete_conversation_sync, pg_trait: ChatStore, pg_method: delete_conversation;
-    fn set_conversation_scope_sync(&self, conversation_id: &str, tag_ids: &[String]) -> Result<ConversationWithTags, AtomicCoreError>
+    fn set_conversation_scope_sync(&self, conversation_id: &str, entries: &[ScopeEntry]) -> Result<ConversationWithTags, AtomicCoreError>
         => sqlite: set_conversation_scope_sync, pg_trait: ChatStore, pg_method: set_conversation_scope;
-    fn add_tag_to_scope_sync(&self, conversation_id: &str, tag_id: &str) -> Result<ConversationWithTags, AtomicCoreError>
+    fn add_tag_to_scope_sync(&self, conversation_id: &str, tag_id: &str, mode: ScopeMode) -> Result<ConversationWithTags, AtomicCoreError>
         => sqlite: add_tag_to_scope_sync, pg_trait: ChatStore, pg_method: add_tag_to_scope;
     fn remove_tag_from_scope_sync(&self, conversation_id: &str, tag_id: &str) -> Result<ConversationWithTags, AtomicCoreError>
         => sqlite: remove_tag_from_scope_sync, pg_trait: ChatStore, pg_method: remove_tag_from_scope;
@@ -553,9 +554,9 @@ dispatch! {
         => sqlite: save_tool_calls_sync, pg_trait: ChatStore, pg_method: save_tool_calls;
     fn save_citations_sync(&self, message_id: &str, citations: &[ChatCitation]) -> Result<(), AtomicCoreError>
         => sqlite: save_citations_sync, pg_trait: ChatStore, pg_method: save_citations;
-    fn get_scope_tag_ids_sync(&self, conversation_id: &str) -> Result<Vec<String>, AtomicCoreError>
-        => sqlite: get_scope_tag_ids_sync, pg_trait: ChatStore, pg_method: get_scope_tag_ids;
-    fn get_scope_description_sync(&self, tag_ids: &[String]) -> Result<String, AtomicCoreError>
+    fn get_conversation_scope_sync(&self, conversation_id: &str) -> Result<crate::search::ScopeFilter, AtomicCoreError>
+        => sqlite: get_conversation_scope_sync, pg_trait: ChatStore, pg_method: get_conversation_scope;
+    fn get_scope_description_sync(&self, scope: &crate::search::ScopeFilter) -> Result<String, AtomicCoreError>
         => sqlite: get_scope_description_sync, pg_trait: ChatStore, pg_method: get_scope_description;
 
     // ---- WikiStore ----

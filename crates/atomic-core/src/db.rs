@@ -281,7 +281,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 22;
+    const LATEST_VERSION: i32 = 24;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -1089,6 +1089,79 @@ impl Database {
         // at server startup with a per-DB idempotency flag. A pure SQL drop
         // here would discard history before the Rust path could rehome it.
         if version < 22 {
+            conn.execute_batch("PRAGMA user_version = 22;")?;
+        }
+
+        // V23: chat citations can point at things that aren't atoms.
+        //
+        // `source_type` says how to read `atom_id`: 'atom' (the atom id,
+        // and the default every pre-existing row keeps), 'wiki' (the tag
+        // id whose article was cited), 'finding' (the finding atom's id).
+        // One id column, one discriminator — exactly one id is ever
+        // meaningful per row.
+        //
+        // The table is rebuilt rather than altered because `atom_id`'s
+        // `REFERENCES atoms(id)` is now wrong: a wiki citation's id is a
+        // tag's, and this connection *does* enforce foreign keys. Losing
+        // the constraint also loses its ON DELETE CASCADE, so deleting an
+        // atom now leaves its citations behind as dead links — which is
+        // already how the Postgres backend behaves (its column never had
+        // the constraint) and how the readers already render a source that
+        // has gone missing.
+        if version < 23 {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('chat_citations') WHERE name='source_type'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if !has_col {
+                conn.execute_batch(
+                    "CREATE TABLE chat_citations_v23 (
+                         id TEXT PRIMARY KEY,
+                         message_id TEXT NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+                         citation_index INTEGER NOT NULL,
+                         atom_id TEXT NOT NULL,
+                         chunk_index INTEGER,
+                         excerpt TEXT NOT NULL,
+                         relevance_score REAL,
+                         source_type TEXT NOT NULL DEFAULT 'atom'
+                     );
+                     INSERT INTO chat_citations_v23
+                         (id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score, source_type)
+                     SELECT id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score, 'atom'
+                     FROM chat_citations;
+                     DROP TABLE chat_citations;
+                     ALTER TABLE chat_citations_v23 RENAME TO chat_citations;
+                     CREATE INDEX IF NOT EXISTS idx_chat_citations_message ON chat_citations(message_id);
+                     CREATE INDEX IF NOT EXISTS idx_chat_citations_atom ON chat_citations(atom_id);",
+                )?;
+            }
+
+            conn.execute_batch("PRAGMA user_version = 23;")?;
+        }
+
+        // V24: a conversation's scope tags carry the role they play —
+        // 'include' (any of them admits an atom), 'require' (all of them
+        // must be present), 'exclude' (none may be). Existing rows default
+        // to 'include', which is exactly the OR scope they already meant.
+        if version < 24 {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('conversation_tags') WHERE name='mode'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE conversation_tags ADD COLUMN mode TEXT NOT NULL DEFAULT 'include';",
+                )?;
+            }
+
             conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
         }
 

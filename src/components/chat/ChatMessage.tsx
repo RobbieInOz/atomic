@@ -1,7 +1,8 @@
 import { useState, useCallback, Fragment, ReactNode, useEffect, useMemo } from 'react';
-import { CheckCircle2, Loader2, Wrench, XCircle } from 'lucide-react';
+import { BookOpen, CheckCircle2, Loader2, Telescope, Wrench, XCircle } from 'lucide-react';
 import { ChatMessageWithContext, ChatCitation, ChatToolCall } from '../../stores/chat';
 import { useAtomsStore, type AtomSummary, type AtomWithTags } from '../../stores/atoms';
+import { useUIStore } from '../../stores/ui';
 import { getTransport } from '../../lib/transport';
 import { CitationLink, CitationPopover } from '../wiki';
 import { MarkdownImage } from '../ui/MarkdownImage';
@@ -20,6 +21,8 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
   const atoms = useAtomsStore(s => s.atoms);
+  const openWikiReader = useUIStore(s => s.openWikiReader);
+  const openFindingReader = useUIStore(s => s.openFindingReader);
 
   const [activeCitation, setActiveCitation] = useState<ChatCitation | null>(null);
   const [anchorRect, setAnchorRect] = useState<{ top: number; left: number; bottom: number; width: number } | null>(null);
@@ -94,6 +97,25 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
       onViewAtom(atomId, highlightText);
     }
     handleClosePopover();
+  };
+
+  // Open whatever a citation points at. The excerpt doubles as the passage
+  // to scroll to, which is what turns a citation into a deep link — except
+  // for findings, whose reader has no highlight support (accepted; the
+  // finding still opens, just at the top).
+  const handleOpenCitation = (citation: ChatCitation) => {
+    switch (citation.source_type) {
+      case 'wiki':
+        openWikiReader(citation.atom_id, citation.source_title ?? 'Wiki', citation.excerpt);
+        handleClosePopover();
+        return;
+      case 'finding':
+        openFindingReader(citation.atom_id);
+        handleClosePopover();
+        return;
+      default:
+        handleViewAtom(citation.atom_id, citation.excerpt);
+    }
   };
 
   // Process text to replace [N] citations and [[atom-id]] references with
@@ -302,9 +324,10 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
                   <button
                     key={citation.id}
                     onClick={(e) => handleCitationClick(citation, e.currentTarget)}
-                    className="px-2 py-0.5 text-xs rounded bg-[var(--color-bg-hover)] hover:bg-[var(--color-border-hover)] text-[var(--color-accent-light)] transition-colors cursor-pointer"
-                    title={citation.excerpt}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-[var(--color-bg-hover)] hover:bg-[var(--color-border-hover)] text-[var(--color-accent-light)] transition-colors cursor-pointer"
+                    title={citation.source_title ? `${citation.source_title} — ${citation.excerpt}` : citation.excerpt}
                   >
+                    <SourceIcon sourceType={citation.source_type} />
                     [{citation.citation_index}]
                   </button>
                 ))}
@@ -315,17 +338,27 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
         </div>
       </div>
 
-      {/* Citation popover */}
+      {/* Citation popover. Where "view source" goes depends on what the
+          citation cites, so the popover's callback defers to the citation
+          rather than assuming an atom. */}
       {activeCitation && anchorRect && (
         <CitationPopover
           citation={activeCitation}
           anchorRect={anchorRect}
           onClose={handleClosePopover}
-          onViewAtom={handleViewAtom}
+          onViewAtom={() => handleOpenCitation(activeCitation)}
         />
       )}
     </>
   );
+}
+
+// Quietly marks the sources that aren't atoms — same icons the wiki and
+// reports views use in the nav.
+function SourceIcon({ sourceType }: { sourceType?: ChatCitation['source_type'] }) {
+  if (sourceType === 'wiki') return <BookOpen className="w-3 h-3" strokeWidth={2} />;
+  if (sourceType === 'finding') return <Telescope className="w-3 h-3" strokeWidth={2} />;
+  return null;
 }
 
 function displayTitleForAtom(atom: Pick<AtomSummary, 'id' | 'title' | 'snippet'>): string {

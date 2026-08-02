@@ -24,6 +24,74 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// Which atoms a search is allowed to return, as three tag lists.
+///
+/// An atom passes iff it carries **at least one** `include` tag (skipped when
+/// `include` is empty), **every** `require` tag, and **no** `exclude` tag.
+/// Every list matches its tags' descendants too, so scoping to a parent tag
+/// scopes to its whole branch. An empty filter admits everything, which makes
+/// the pre-boolean behavior — OR over a flat include list — the degenerate
+/// case rather than a separate code path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeFilter {
+    pub include: Vec<String>,
+    pub require: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl ScopeFilter {
+    /// The flat-list shape: every tag included, OR semantics.
+    pub fn including(tag_ids: Vec<String>) -> Self {
+        Self {
+            include: tag_ids,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.require.is_empty() && self.exclude.is_empty()
+    }
+
+    pub fn push(&mut self, tag_id: String, mode: crate::models::ScopeMode) {
+        match mode {
+            crate::models::ScopeMode::Include => self.include.push(tag_id),
+            crate::models::ScopeMode::Require => self.require.push(tag_id),
+            crate::models::ScopeMode::Exclude => self.exclude.push(tag_id),
+        }
+    }
+
+    /// Every tag named by the filter — the roots a backend expands to
+    /// descendants before evaluating the predicate.
+    pub fn roots(&self) -> Vec<String> {
+        let mut roots = self.include.clone();
+        roots.extend(self.require.iter().cloned());
+        roots.extend(self.exclude.iter().cloned());
+        roots
+    }
+
+    /// Decide which of `atom_ids` the filter admits, given — per atom — the
+    /// scope roots it matched directly or through a descendant tag. Backends
+    /// differ only in how they build `matched_roots`; the predicate itself
+    /// lives here so both answer identically.
+    pub fn admitted<'a>(
+        &self,
+        atom_ids: impl IntoIterator<Item = &'a str>,
+        matched_roots: &HashMap<String, std::collections::HashSet<String>>,
+    ) -> std::collections::HashSet<String> {
+        let none = std::collections::HashSet::new();
+        atom_ids
+            .into_iter()
+            .filter(|atom_id| {
+                let roots = matched_roots.get(*atom_id).unwrap_or(&none);
+                (self.include.is_empty() || self.include.iter().any(|t| roots.contains(t)))
+                    && self.require.iter().all(|t| roots.contains(t))
+                    && !self.exclude.iter().any(|t| roots.contains(t))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+}
+
 /// Options for search queries
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -35,8 +103,8 @@ pub struct SearchOptions {
     pub limit: i32,
     /// Minimum similarity threshold (0.0-1.0) for semantic/hybrid modes
     pub threshold: f32,
-    /// Optional tag IDs to filter results (only return atoms with these tags)
-    pub scope_tag_ids: Vec<String>,
+    /// Which atoms are eligible at all; see [`ScopeFilter`]
+    pub scope: ScopeFilter,
     /// Optional recency filter: only return atoms created within the last N days
     pub since_days: Option<i32>,
     /// Atom-kind filter. Defaults to `KindFilter::All` so existing callers
@@ -54,7 +122,7 @@ impl SearchOptions {
             mode,
             limit,
             threshold: 0.3,
-            scope_tag_ids: vec![],
+            scope: ScopeFilter::default(),
             since_days: None,
             kinds: KindFilter::All,
         }
@@ -65,8 +133,15 @@ impl SearchOptions {
         self
     }
 
+    /// Scope to a flat tag list (include semantics). Callers with modes use
+    /// [`SearchOptions::with_scope_filter`].
     pub fn with_scope(mut self, tag_ids: Vec<String>) -> Self {
-        self.scope_tag_ids = tag_ids;
+        self.scope = ScopeFilter::including(tag_ids);
+        self
+    }
+
+    pub fn with_scope_filter(mut self, scope: ScopeFilter) -> Self {
+        self.scope = scope;
         self
     }
 
@@ -88,7 +163,7 @@ impl Default for SearchOptions {
             mode: SearchMode::Hybrid,
             limit: 10,
             threshold: 0.3,
-            scope_tag_ids: vec![],
+            scope: ScopeFilter::default(),
             since_days: None,
             kinds: KindFilter::All,
         }
@@ -443,7 +518,7 @@ async fn search_keyword_chunks(
     };
 
     // Apply tag scope filter if specified
-    let filtered = filter_by_scope(&conn, raw_results, &options.scope_tag_ids)?;
+    let filtered = filter_by_scope(&conn, raw_results, &options.scope)?;
     // Apply atom-kind filter (e.g. exclude report findings on external paths).
     let filtered = filter_by_kind(&conn, filtered, &options.kinds)?;
 
@@ -560,10 +635,10 @@ async fn search_semantic_chunks(
     let chunk_map = batch_fetch_chunk_info(&conn, &chunk_ids)?;
 
     // Pre-compute scope filter for all candidate atom_ids in one batch query
-    let scope_atom_ids: std::collections::HashSet<String> = if !options.scope_tag_ids.is_empty() {
+    let scope_atom_ids: std::collections::HashSet<String> = if !options.scope.is_empty() {
         let candidate_atom_ids: Vec<&str> =
             chunk_map.values().map(|(aid, _, _)| aid.as_str()).collect();
-        batch_atoms_with_scope_tags(&conn, &candidate_atom_ids, &options.scope_tag_ids)?
+        atoms_passing_scope(&conn, &candidate_atom_ids, &options.scope)?
     } else {
         std::collections::HashSet::new()
     };
@@ -579,7 +654,7 @@ async fn search_semantic_chunks(
     for (chunk_id, distance) in filtered {
         let similarity = distance_to_similarity(distance);
         if let Some((atom_id, content, chunk_index)) = chunk_map.get(&chunk_id) {
-            if !options.scope_tag_ids.is_empty() && !scope_atom_ids.contains(atom_id) {
+            if !options.scope.is_empty() && !scope_atom_ids.contains(atom_id) {
                 continue;
             }
             if let Some(ref allowed) = kind_allowed_atom_ids {
@@ -674,19 +749,18 @@ async fn search_hybrid_chunks(
 fn filter_by_scope<T>(
     conn: &rusqlite::Connection,
     results: Vec<(String, String, String, i32, T)>,
-    scope_tag_ids: &[String],
+    scope: &ScopeFilter,
 ) -> Result<Vec<(String, String, String, i32, T)>, String> {
-    if scope_tag_ids.is_empty() {
+    if scope.is_empty() {
         return Ok(results);
     }
 
-    // Batch check: get all atom_ids that have at least one scope tag
     let atom_ids: Vec<&str> = results.iter().map(|r| r.1.as_str()).collect();
-    let matching_atom_ids = batch_atoms_with_scope_tags(conn, &atom_ids, scope_tag_ids)?;
+    let passing = atoms_passing_scope(conn, &atom_ids, scope)?;
 
     let filtered = results
         .into_iter()
-        .filter(|r| matching_atom_ids.contains(r.1.as_str()))
+        .filter(|r| passing.contains(r.1.as_str()))
         .collect();
     Ok(filtered)
 }
@@ -768,31 +842,48 @@ fn batch_atom_ids_matching_kind<'a>(
     Ok(Some(allowed))
 }
 
-/// Batch check which atom_ids have at least one of the specified scope tags.
-/// Returns the set of matching atom_ids.
-fn batch_atoms_with_scope_tags(
+/// Resolve which of `atom_ids` the scope filter admits.
+///
+/// One query maps each candidate atom to the scope *roots* it carries —
+/// walking each root's descendants, so a scope on a parent tag covers its
+/// branch — and [`ScopeFilter::admitted`] turns that into the answer. Shared
+/// by every SQLite retrieval path so include/require/exclude means one thing.
+pub(crate) fn atoms_passing_scope(
     conn: &rusqlite::Connection,
     atom_ids: &[&str],
-    scope_tag_ids: &[String],
+    scope: &ScopeFilter,
 ) -> Result<std::collections::HashSet<String>, String> {
-    if atom_ids.is_empty() || scope_tag_ids.is_empty() {
+    if scope.is_empty() {
+        return Ok(atom_ids.iter().map(|id| id.to_string()).collect());
+    }
+    if atom_ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
 
+    let roots = scope.roots();
     let atom_placeholders: Vec<&str> = atom_ids.iter().map(|_| "?").collect();
-    let tag_placeholders: Vec<&str> = scope_tag_ids.iter().map(|_| "?").collect();
+    let tag_placeholders: Vec<&str> = roots.iter().map(|_| "?").collect();
     let query = format!(
-        "SELECT DISTINCT atom_id FROM atom_tags WHERE atom_id IN ({}) AND tag_id IN ({})",
-        atom_placeholders.join(","),
-        tag_placeholders.join(","),
+        "WITH RECURSIVE scope_tags(root_id, id) AS (
+            SELECT id, id FROM tags WHERE id IN ({tag_ph})
+            UNION ALL
+            SELECT st.root_id, t.id FROM tags t
+            INNER JOIN scope_tags st ON t.parent_id = st.id
+         )
+         SELECT DISTINCT st.root_id, att.atom_id
+         FROM atom_tags att
+         INNER JOIN scope_tags st ON st.id = att.tag_id
+         WHERE att.atom_id IN ({atom_ph})",
+        tag_ph = tag_placeholders.join(","),
+        atom_ph = atom_placeholders.join(","),
     );
 
-    let mut params: Vec<&dyn rusqlite::ToSql> =
-        Vec::with_capacity(atom_ids.len() + scope_tag_ids.len());
-    for id in atom_ids {
+    // Bind order matches SQL: roots first (CTE), then atom_ids (WHERE)
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(atom_ids.len() + roots.len());
+    for id in &roots {
         params.push(id);
     }
-    for id in scope_tag_ids {
+    for id in atom_ids {
         params.push(id);
     }
 
@@ -801,15 +892,17 @@ fn batch_atoms_with_scope_tags(
         .map_err(|e| format!("Failed to prepare scope query: {}", e))?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|e| format!("Failed to execute scope query: {}", e))?;
 
-    let mut matching = std::collections::HashSet::new();
+    let mut matched: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     for row in rows {
-        matching.insert(row.map_err(|e| format!("Failed to read scope result: {}", e))?);
+        let (root_id, atom_id) = row.map_err(|e| format!("Failed to read scope result: {}", e))?;
+        matched.entry(atom_id).or_default().insert(root_id);
     }
-    Ok(matching)
+
+    Ok(scope.admitted(atom_ids.iter().copied(), &matched))
 }
 
 /// Find atoms similar to a given atom based on embedding similarity
@@ -993,7 +1086,7 @@ mod tests {
         assert_eq!(options.mode, SearchMode::Hybrid);
         assert_eq!(options.limit, 10);
         assert_eq!(options.threshold, 0.3);
-        assert!(options.scope_tag_ids.is_empty());
+        assert!(options.scope.is_empty());
     }
 
     #[test]
@@ -1006,7 +1099,7 @@ mod tests {
         assert_eq!(options.mode, SearchMode::Semantic);
         assert_eq!(options.limit, 20);
         assert_eq!(options.threshold, 0.5);
-        assert_eq!(options.scope_tag_ids, vec!["tag1".to_string()]);
+        assert_eq!(options.scope.include, vec!["tag1".to_string()]);
     }
 
     // ==================== find_similar_atoms Tests ====================

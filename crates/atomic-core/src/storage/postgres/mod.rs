@@ -165,6 +165,14 @@ const MIGRATIONS: &[(i32, &str)] = &[
         23,
         include_str!("migrations/023_wiki_links_nullable_target.sql"),
     ),
+    (
+        24,
+        include_str!("migrations/024_chat_citations_source_type.sql"),
+    ),
+    (
+        25,
+        include_str!("migrations/025_conversation_tags_mode.sql"),
+    ),
 ];
 
 /// Postgres-backed storage implementation using sqlx + pgvector.

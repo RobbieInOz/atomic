@@ -12,6 +12,21 @@ export interface Tag {
   created_at: string;
 }
 
+// The role a tag plays in a conversation's scope. An atom is in scope when it
+// carries at least one `include` tag (skipped when nothing is included),
+// every `require` tag, and no `exclude` tag — child tags count as their
+// parent. `include` is what every tag meant before modes existed.
+export type ScopeMode = 'include' | 'require' | 'exclude';
+
+export interface ScopeTag extends Tag {
+  mode: ScopeMode;
+}
+
+export interface ScopeEntry {
+  tag_id: string;
+  mode: ScopeMode;
+}
+
 export interface Conversation {
   id: string;
   title: string | null;
@@ -21,7 +36,7 @@ export interface Conversation {
 }
 
 export interface ConversationWithTags extends Conversation {
-  tags: Tag[];
+  tags: ScopeTag[];
   message_count: number;
   last_message_preview: string | null;
 }
@@ -46,6 +61,12 @@ export interface ChatToolCall {
   completed_at: string | null;
 }
 
+// What a citation points at. `atom_id` is read according to it: an atom id,
+// the tag id of a wiki article, or a finding's atom id. Citations stored
+// before source types existed arrive without the field, so it is optional
+// and absent means 'atom'.
+export type CitationSourceType = 'atom' | 'wiki' | 'finding';
+
 export interface ChatCitation {
   id: string;
   message_id: string;
@@ -54,6 +75,9 @@ export interface ChatCitation {
   chunk_index: number | null;
   excerpt: string;
   relevance_score: number | null;
+  source_type?: CitationSourceType;
+  // Display name for a source an id can't name — the tag behind a wiki citation.
+  source_title?: string | null;
 }
 
 export interface ChatMessageWithContext extends ChatMessage {
@@ -62,7 +86,7 @@ export interface ChatMessageWithContext extends ChatMessage {
 }
 
 export interface ConversationWithMessages extends Conversation {
-  tags: Tag[];
+  tags: ScopeTag[];
   messages: ChatMessageWithContext[];
 }
 
@@ -177,8 +201,9 @@ interface ChatStore {
   setPageContextEnabled: (conversationId: string, enabled: boolean) => void;
 
   // Actions - Scope Management
-  setScope: (tagIds: string[]) => Promise<void>;
-  addTagToScope: (tagId: string) => Promise<void>;
+  setScope: (entries: ScopeEntry[]) => Promise<void>;
+  // Doubles as "set this tag's mode": a tag already in scope changes mode.
+  addTagToScope: (tagId: string, mode?: ScopeMode) => Promise<void>;
   removeTagFromScope: (tagId: string) => Promise<void>;
 
   // Actions - Messaging
@@ -402,14 +427,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   // Scope Management
-  setScope: async (tagIds: string[]) => {
+  setScope: async (entries: ScopeEntry[]) => {
     const { currentConversation } = get();
     if (!currentConversation) return;
 
     try {
       const updated = await getTransport().invoke<ConversationWithTags>('set_conversation_scope', {
         conversationId: currentConversation.id,
-        tagIds,
+        entries,
       });
       set({ currentConversation: updated });
     } catch (e) {
@@ -417,7 +442,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  addTagToScope: async (tagId: string) => {
+  addTagToScope: async (tagId: string, mode: ScopeMode = 'include') => {
     const { currentConversation } = get();
     if (!currentConversation) return;
 
@@ -425,6 +450,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const updated = await getTransport().invoke<ConversationWithTags>('add_tag_to_scope', {
         conversationId: currentConversation.id,
         tagId,
+        mode,
       });
       set({ currentConversation: updated });
     } catch (e) {

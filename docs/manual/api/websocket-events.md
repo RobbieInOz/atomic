@@ -83,6 +83,7 @@ These power progress UI for Obsidian import, URL ingestion, browser clipping, iO
 - `ChatComplete`
 - `ChatCanvasAction`
 - `ChatError`
+- `ChatConversationUpdated`
 
 The message send endpoint returns a final response, but the UI receives streaming deltas and tool events over WebSocket.
 

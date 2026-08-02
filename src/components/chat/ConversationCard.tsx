@@ -105,7 +105,11 @@ export function ConversationCard({
               {conversation.tags.slice(0, 3).map((tag) => (
                 <span
                   key={tag.id}
-                  className="px-2 py-0.5 text-xs rounded bg-[var(--color-accent)]/20 text-[var(--color-accent-light)]"
+                  className={`px-2 py-0.5 text-xs rounded ${
+                    tag.mode === 'exclude'
+                      ? 'bg-red-500/10 text-red-300 line-through decoration-red-400/60'
+                      : 'bg-[var(--color-accent)]/20 text-[var(--color-accent-light)]'
+                  }`}
                 >
                   {tag.name}
                 </span>

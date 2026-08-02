@@ -29,7 +29,7 @@ impl PostgresStorage {
             .keyword_search(
                 query_trimmed,
                 section_limit,
-                &[],
+                &crate::search::ScopeFilter::default(),
                 None,
                 &crate::models::KindFilter::All,
             )
@@ -57,7 +57,7 @@ impl SearchStore for PostgresStorage {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        scope_tag_ids: &[String],
+        scope: &crate::search::ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
@@ -108,20 +108,14 @@ impl SearchStore for PostgresStorage {
             .collect();
 
         // Scope filtering by tag if specified
-        let scope_atom_ids: std::collections::HashSet<String> = if scope_tag_ids.is_empty() {
+        let scope_atom_ids: std::collections::HashSet<String> = if scope.is_empty() {
             std::collections::HashSet::new()
         } else {
             let candidate_atom_ids: Vec<&str> = filtered
                 .iter()
                 .map(|(_, aid, _, _, _)| aid.as_str())
                 .collect();
-            pg_batch_atoms_with_scope_tags(
-                &self.pool,
-                &candidate_atom_ids,
-                scope_tag_ids,
-                &self.db_id,
-            )
-            .await?
+            pg_atoms_passing_scope(&self.pool, &candidate_atom_ids, scope, &self.db_id).await?
         };
         // Kind filtering. `None` = `KindFilter::All` (no filter applied).
         let kind_allowed: Option<std::collections::HashSet<String>> =
@@ -146,7 +140,7 @@ impl SearchStore for PostgresStorage {
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();
         for (_chunk_id, atom_id, content, chunk_index, similarity) in &filtered {
-            if !scope_tag_ids.is_empty() && !scope_atom_ids.contains(atom_id) {
+            if !scope.is_empty() && !scope_atom_ids.contains(atom_id) {
                 continue;
             }
             if let Some(ref allowed) = kind_allowed {
@@ -206,7 +200,7 @@ impl SearchStore for PostgresStorage {
         &self,
         query: &str,
         limit: i32,
-        scope_tag_ids: &[String],
+        scope: &crate::search::ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
@@ -253,20 +247,15 @@ impl SearchStore for PostgresStorage {
         .map_err(|e| AtomicCoreError::Search(format!("Keyword search failed: {}", e)))?;
 
         // Apply tag scope filter if specified
-        let filtered = if scope_tag_ids.is_empty() {
+        let filtered = if scope.is_empty() {
             rows
         } else {
             let candidate_atom_ids: Vec<&str> =
                 rows.iter().map(|(_, aid, _, _, _)| aid.as_str()).collect();
-            let matching = pg_batch_atoms_with_scope_tags(
-                &self.pool,
-                &candidate_atom_ids,
-                scope_tag_ids,
-                &self.db_id,
-            )
-            .await?;
+            let passing =
+                pg_atoms_passing_scope(&self.pool, &candidate_atom_ids, scope, &self.db_id).await?;
             rows.into_iter()
-                .filter(|(_, aid, _, _, _)| matching.contains(aid.as_str()))
+                .filter(|(_, aid, _, _, _)| passing.contains(aid.as_str()))
                 .collect()
         };
 
@@ -349,7 +338,7 @@ impl SearchStore for PostgresStorage {
         &self,
         query: &str,
         limit: i32,
-        scope_tag_ids: &[String],
+        scope: &crate::search::ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
@@ -395,20 +384,15 @@ impl SearchStore for PostgresStorage {
         .map_err(|e| AtomicCoreError::Search(format!("Keyword chunk search failed: {}", e)))?;
 
         // Apply scope filter
-        let filtered = if scope_tag_ids.is_empty() {
+        let filtered = if scope.is_empty() {
             rows
         } else {
             let candidate_atom_ids: Vec<&str> =
                 rows.iter().map(|(_, aid, _, _, _)| aid.as_str()).collect();
-            let matching = pg_batch_atoms_with_scope_tags(
-                &self.pool,
-                &candidate_atom_ids,
-                scope_tag_ids,
-                &self.db_id,
-            )
-            .await?;
+            let passing =
+                pg_atoms_passing_scope(&self.pool, &candidate_atom_ids, scope, &self.db_id).await?;
             rows.into_iter()
-                .filter(|(_, aid, _, _, _)| matching.contains(aid.as_str()))
+                .filter(|(_, aid, _, _, _)| passing.contains(aid.as_str()))
                 .collect()
         };
 
@@ -449,7 +433,7 @@ impl SearchStore for PostgresStorage {
         query_embedding: &[f32],
         limit: i32,
         threshold: f32,
-        scope_tag_ids: &[String],
+        scope: &crate::search::ScopeFilter,
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>> {
@@ -498,23 +482,18 @@ impl SearchStore for PostgresStorage {
             .collect();
 
         // Apply scope filter
-        let scoped = if scope_tag_ids.is_empty() {
+        let scoped = if scope.is_empty() {
             filtered
         } else {
             let candidate_atom_ids: Vec<&str> = filtered
                 .iter()
                 .map(|(_, aid, _, _, _)| aid.as_str())
                 .collect();
-            let matching = pg_batch_atoms_with_scope_tags(
-                &self.pool,
-                &candidate_atom_ids,
-                scope_tag_ids,
-                &self.db_id,
-            )
-            .await?;
+            let passing =
+                pg_atoms_passing_scope(&self.pool, &candidate_atom_ids, scope, &self.db_id).await?;
             filtered
                 .into_iter()
-                .filter(|(_, aid, _, _, _)| matching.contains(aid.as_str()))
+                .filter(|(_, aid, _, _, _)| passing.contains(aid.as_str()))
                 .collect()
         };
 
@@ -754,39 +733,53 @@ async fn pg_batch_fetch_tags(
     Ok(map)
 }
 
-/// Batch check which atom_ids have at least one of the specified scope tags.
-async fn pg_batch_atoms_with_scope_tags(
+/// Resolve which of `atom_ids` the scope filter admits. Mirrors the SQLite
+/// helper: one query maps each candidate to the scope *roots* it carries
+/// (walking each root's descendants), and the shared predicate in
+/// `ScopeFilter::admitted` turns that into the answer, so include/require/
+/// exclude means the same thing on both backends.
+async fn pg_atoms_passing_scope(
     pool: &sqlx::PgPool,
     atom_ids: &[&str],
-    scope_tag_ids: &[String],
+    scope: &crate::search::ScopeFilter,
     db_id: &str,
 ) -> Result<std::collections::HashSet<String>, AtomicCoreError> {
-    if atom_ids.is_empty() || scope_tag_ids.is_empty() {
+    if scope.is_empty() {
+        return Ok(atom_ids.iter().map(|id| id.to_string()).collect());
+    }
+    if atom_ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
 
     let atom_id_strings: Vec<String> = atom_ids.iter().map(|s| s.to_string()).collect();
+    let roots = scope.roots();
 
-    // Use recursive CTE to include atoms tagged with descendants of the scope tags
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "WITH RECURSIVE scope_tags(id) AS (
-            SELECT id FROM tags WHERE id = ANY($2) AND db_id = $3
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "WITH RECURSIVE scope_tags(root_id, id) AS (
+            SELECT id, id FROM tags WHERE id = ANY($2) AND db_id = $3
             UNION ALL
-            SELECT t.id FROM tags t
+            SELECT st.root_id, t.id FROM tags t
             INNER JOIN scope_tags st ON t.parent_id = st.id
             WHERE t.db_id = $3
          )
-         SELECT DISTINCT atom_id FROM atom_tags
-         WHERE atom_id = ANY($1) AND tag_id IN (SELECT id FROM scope_tags) AND db_id = $3",
+         SELECT DISTINCT st.root_id, att.atom_id
+         FROM atom_tags att
+         INNER JOIN scope_tags st ON st.id = att.tag_id
+         WHERE att.atom_id = ANY($1) AND att.db_id = $3",
     )
     .bind(&atom_id_strings)
-    .bind(scope_tag_ids)
+    .bind(&roots)
     .bind(db_id)
     .fetch_all(pool)
     .await
     .map_err(|e| AtomicCoreError::Search(format!("Failed to check scope tags: {}", e)))?;
 
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    let mut matched: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for (root_id, atom_id) in rows {
+        matched.entry(atom_id).or_default().insert(root_id);
+    }
+
+    Ok(scope.admitted(atom_ids.iter().copied(), &matched))
 }
 
 /// Batch lookup of which atom_ids match the given `KindFilter`. Caller is

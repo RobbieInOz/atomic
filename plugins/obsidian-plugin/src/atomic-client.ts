@@ -130,6 +130,11 @@ export interface ChatCitation {
   relevance_score: number | null;
   /** Source URL of the cited atom (populated by server for client linking). */
   source_url?: string | null;
+  /**
+   * What `atom_id` identifies: an atom, the tag behind a wiki article, or a
+   * finding's atom. Absent on citations stored before source types existed.
+   */
+  source_type?: "atom" | "wiki" | "finding";
 }
 
 export interface ChatMessageWithContext extends ChatMessage {

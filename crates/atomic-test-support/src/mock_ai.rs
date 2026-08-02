@@ -86,6 +86,10 @@ struct MockAiCounters {
     /// arrival order — lets tests assert *which* model an operation selected,
     /// not just that a call happened.
     chat_models: Mutex<Vec<String>>,
+    /// Every `/v1/chat/completions` request body, in arrival order. Lets a
+    /// test assert what an agent actually sent the model — which tool results
+    /// came back, and what a final pass was asked to write from.
+    chat_bodies: Mutex<Vec<Value>>,
     /// When set, `/v1/embeddings` serves this failure instead of embeddings.
     embedding_failure: Mutex<Option<InjectedFailure>>,
     /// When set, `/v1/chat/completions` serves this failure instead of a
@@ -99,6 +103,20 @@ struct MockAiCounters {
     /// another tool call instead of wrapping up — a model that never stops
     /// researching, which is how tests reach the agent loop's iteration cap.
     chat_force_tool_calls: AtomicBool,
+    /// When set, the tool-call leg asks for this `(tool_name, arguments)`
+    /// instead of `search_atoms`, so a test can drive any registered tool —
+    /// or one the registry doesn't have — through the real loop.
+    chat_tool_call: Mutex<Option<(String, Value)>>,
+    /// Script for the non-streaming tool-bearing leg — the research loops
+    /// reports and wiki generation run. One entry per model turn, each a
+    /// round of `(tool_name, arguments)` calls issued together. Empty (the
+    /// default) means the leg calls `done` on its first turn.
+    research_tool_rounds: Mutex<Vec<Vec<(String, Value)>>>,
+    /// When true the research leg never falls back to `done`: once the script
+    /// runs out it repeats its last round, so the loop can only end at its
+    /// own iteration cap. With no script there is nothing to repeat and the
+    /// leg still calls `done`.
+    research_force_tool_calls: AtomicBool,
     /// Conversation-title requests seen so far. Counted separately from
     /// `chat_requests` because title generation is fire-and-forget: a test
     /// waits on this to know the detached task actually ran.
@@ -162,6 +180,16 @@ impl MockAiServer {
             .clone()
     }
 
+    /// Every chat-completions request body so far, in arrival order — the
+    /// messages an agent actually sent, tool results included.
+    pub fn chat_request_bodies(&self) -> Vec<Value> {
+        self.counters
+            .chat_bodies
+            .lock()
+            .expect("chat_bodies lock")
+            .clone()
+    }
+
     /// Make `/v1/embeddings` fail with `failure` until cleared with `None`.
     /// Requests are still counted while failing.
     pub fn set_embedding_failure(&self, failure: Option<InjectedFailure>) {
@@ -200,6 +228,47 @@ impl MockAiServer {
             .store(force, Ordering::Relaxed);
     }
 
+    /// Make the tool-call leg request `(tool_name, arguments)` instead of
+    /// `search_atoms`. Clear with `None`.
+    pub fn set_chat_tool_call(&self, call: Option<(&str, Value)>) {
+        *self
+            .counters
+            .chat_tool_call
+            .lock()
+            .expect("chat_tool_call lock") =
+            call.map(|(name, arguments)| (name.to_string(), arguments));
+    }
+
+    /// Script the non-streaming research leg (reports, wiki) turn by turn:
+    /// `rounds[n]` is the set of tool calls the model makes on its nth turn,
+    /// and the leg calls `done` once the script runs out. An empty script is
+    /// the default — `done` immediately, no research.
+    pub fn set_research_tool_rounds(&self, rounds: Vec<Vec<(&str, Value)>>) {
+        *self
+            .counters
+            .research_tool_rounds
+            .lock()
+            .expect("research_tool_rounds lock") = rounds
+            .into_iter()
+            .map(|round| {
+                round
+                    .into_iter()
+                    .map(|(name, arguments)| (name.to_string(), arguments))
+                    .collect()
+            })
+            .collect();
+    }
+
+    /// Keep the research leg on its script's last round forever instead of
+    /// falling back to `done`, so a run can only end at its own iteration
+    /// cap. Pair it with [`Self::set_research_tool_rounds`] — with no script
+    /// there is nothing to repeat.
+    pub fn set_research_force_tool_calls(&self, force: bool) {
+        self.counters
+            .research_force_tool_calls
+            .store(force, Ordering::Relaxed);
+    }
+
     /// Conversation-title completions requested so far. Zero means the
     /// detached title task never reached the provider.
     pub fn title_request_count(&self) -> usize {
@@ -224,6 +293,11 @@ impl MockAiServer {
             .chat_models
             .lock()
             .expect("chat_models lock")
+            .clear();
+        self.counters
+            .chat_bodies
+            .lock()
+            .expect("chat_bodies lock")
             .clear();
     }
 }
@@ -271,12 +345,18 @@ fn embed_text(text: &str) -> Vec<f32> {
 ///   deterministic text, closing with `finish_reason: stop`.
 ///
 /// `force_tool_calls` keeps a tool-bearing request on the tool-call leg
-/// forever (see [`MockAiServer::set_chat_force_tool_calls`]).
+/// forever (see [`MockAiServer::set_chat_force_tool_calls`]); `tool_call`
+/// replaces the tool the leg asks for (see
+/// [`MockAiServer::set_chat_tool_call`]).
 ///
 /// The provider parser is line-oriented (`data: ...\n`) and accepts the
 /// stream as a single body payload, so we don't need true chunked transfer
 /// to satisfy it.
-fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemplate {
+fn streaming_chat_response(
+    body: &Value,
+    force_tool_calls: bool,
+    tool_call: Option<(String, Value)>,
+) -> ResponseTemplate {
     let has_tool_results = body
         .get("messages")
         .and_then(|v| v.as_array())
@@ -298,6 +378,9 @@ fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemp
     let sse_body = if answer_with_text {
         // Final leg: emit the assistant text. Split across two deltas so
         // tests exercise incremental streaming rather than one-shot content.
+        // The trailing `[1]` is the citation contract in miniature: the
+        // runtime stores only the evidence the answer actually cites, so an
+        // answer with no markers produces no citations at all.
         let chunks = [
             json!({
                 "choices": [{
@@ -307,7 +390,7 @@ fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemp
             }),
             json!({
                 "choices": [{
-                    "delta": { "content": "grounded in the search results." },
+                    "delta": { "content": "grounded in the search results. [1]" },
                     "finish_reason": null,
                 }]
             }),
@@ -320,16 +403,23 @@ fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemp
         ];
         sse_concat(&chunks)
     } else {
-        // First leg: ask the runtime to run `search_atoms`. The query is
-        // lifted from the most recent user message so the search hits the
-        // seeded atoms verbatim. The tool-call id must be unique per
-        // response — the runtime persists tool calls by this id, and
-        // concurrent conversations would otherwise collide on it.
-        let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
-        let arguments = json!({ "query": query, "limit": 5 }).to_string();
+        // First leg: ask the runtime to run a tool — `search_atoms` by
+        // default, with the query lifted from the most recent user message
+        // so the search hits the seeded atoms verbatim. The tool-call id
+        // must be unique per response — the runtime persists tool calls by
+        // this id, and concurrent conversations would otherwise collide.
+        let (tool_name, arguments) = tool_call.unwrap_or_else(|| {
+            let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
+            (
+                "search_atoms".to_string(),
+                json!({ "query": query, "limit": 5 }),
+            )
+        });
+        let arguments = arguments.to_string();
         static TOOL_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
         let call_id = format!(
-            "call_mock_search_{}",
+            "call_mock_{}_{}",
+            tool_name,
             TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let chunks = [
@@ -341,7 +431,7 @@ fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemp
                             "id": call_id,
                             "type": "function",
                             "function": {
-                                "name": "search_atoms",
+                                "name": tool_name,
                                 "arguments": arguments,
                             }
                         }]
@@ -362,6 +452,77 @@ fn streaming_chat_response(body: &Value, force_tool_calls: bool) -> ResponseTemp
     ResponseTemplate::new(200)
         .insert_header("Content-Type", "text/event-stream")
         .set_body_raw(sse_body.into_bytes(), "text/event-stream")
+}
+
+/// Build a non-streaming `chat/completions` response for a research loop —
+/// the shape reports and wiki generation drive through `complete_with_tools`,
+/// where the model researches with tools and calls `done` when it has enough.
+///
+/// Which turn the model is on is recovered by counting the assistant messages
+/// that already carry tool calls, so `rounds[n]` is served on the nth turn
+/// however many calls each round makes. Past the end of the script the leg
+/// calls `done` — which, with the default empty script, is the first turn.
+/// `force` keeps it on the script's last round instead (see
+/// [`MockAiServer::set_research_force_tool_calls`]).
+fn research_chat_response(
+    body: &Value,
+    rounds: &[Vec<(String, Value)>],
+    force: bool,
+) -> ResponseTemplate {
+    let done_round = vec![("done".to_string(), json!({}))];
+    let turn = completed_tool_rounds(body);
+    let round = rounds
+        .get(turn)
+        .or_else(|| force.then(|| rounds.last()).flatten())
+        .unwrap_or(&done_round);
+
+    // Ids must be unique per call — both loops key their tool-result messages
+    // by id, and a repeated id makes the transcript ambiguous.
+    static TOOL_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let tool_calls: Vec<Value> = round
+        .iter()
+        .map(|(name, arguments)| {
+            json!({
+                "id": format!("call_mock_{}_{}", name, TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)),
+                "type": "function",
+                "function": { "name": name, "arguments": arguments.to_string() }
+            })
+        })
+        .collect();
+
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": "mock-cmpl",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": tool_calls,
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+}
+
+/// Model turns already spent on tools — the index of the round being asked
+/// for now.
+fn completed_tool_rounds(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                        && message
+                            .get("tool_calls")
+                            .and_then(|calls| calls.as_array())
+                            .is_some_and(|calls| !calls.is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn sse_concat(chunks: &[Value]) -> String {
@@ -511,6 +672,11 @@ impl Respond for ChatResponder {
                 .expect("chat_models lock")
                 .push(model.to_string());
         }
+        self.counters
+            .chat_bodies
+            .lock()
+            .expect("chat_bodies lock")
+            .push(body.clone());
 
         // Streaming chat (agent loop). `stream: true` is answered with SSE
         // whatever else the request carries — see `streaming_chat_response`
@@ -527,36 +693,32 @@ impl Respond for ChatResponder {
             .unwrap_or(false);
         if is_streaming {
             let force = self.counters.chat_force_tool_calls.load(Ordering::Relaxed);
-            return with_delay(streaming_chat_response(&body, force));
+            let tool_call = self
+                .counters
+                .chat_tool_call
+                .lock()
+                .expect("chat_tool_call lock")
+                .clone();
+            return with_delay(streaming_chat_response(&body, force, tool_call));
         }
 
-        // Non-streaming chat with tools — used by the reports agentic loop.
-        // The agent expects either a tool call (research) or a content
-        // response with no tool calls (loop terminator). We short-circuit
-        // by calling `done` immediately, which keeps the research phase
-        // out of the report e2e tests (search-based tool flow is already
-        // covered by slice 3c's chat suite).
+        // Non-streaming chat with tools — the research loops reports and wiki
+        // generation run. Unscripted, it calls `done` immediately, which
+        // keeps the research phase out of tests that only care about what a
+        // run writes. `set_research_tool_rounds` scripts the research turns
+        // for the tests that do care.
         if !is_streaming && has_tools {
-            return with_delay(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "mock-cmpl",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_done",
-                            "type": "function",
-                            "function": {
-                                "name": "done",
-                                "arguments": "{}"
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            })));
+            let rounds = self
+                .counters
+                .research_tool_rounds
+                .lock()
+                .expect("research_tool_rounds lock")
+                .clone();
+            let force = self
+                .counters
+                .research_force_tool_calls
+                .load(Ordering::Relaxed);
+            return with_delay(research_chat_response(&body, &rounds, force));
         }
 
         // Inspect the requested schema name so this responder can serve

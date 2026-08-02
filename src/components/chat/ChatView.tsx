@@ -122,6 +122,10 @@ export function ChatView() {
     );
   }
 
+  const scopeSubjects = currentConversation.tags
+    .filter((t) => t.mode !== 'exclude')
+    .map((t) => t.name);
+
   return (
     <div className="h-full flex flex-col">
       {/* Header with back button and scope */}
@@ -218,8 +222,10 @@ export function ChatView() {
         isCancelling={isCancelling}
         onStop={cancelResponse}
         placeholder={
-          currentConversation.tags.length > 0
-            ? `Ask about ${currentConversation.tags.map(t => t.name).join(', ')}...`
+          // Excluded tags say what the conversation isn't about — naming them
+          // here would read as the opposite of the scope.
+          scopeSubjects.length > 0
+            ? `Ask about ${scopeSubjects.join(', ')}...`
             : 'Ask anything about your knowledge base...'
         }
       />

@@ -380,13 +380,13 @@ pub(super) const TABLE_SPECS: &[TableSpec] = &[
     TableSpec {
         table: "conversation_tags",
         source_table: "conversation_tags",
-        select_exprs: "conversation_id, tag_id",
+        select_exprs: "conversation_id, tag_id, COALESCE(mode, 'include')",
         guard: Some(
             "conversation_id IN (SELECT id FROM conversations) \
              AND tag_id IN (SELECT id FROM tags)",
         ),
-        pg_cols: &["conversation_id", "tag_id"],
-        types: &[Col::Text, Col::Text],
+        pg_cols: &["conversation_id", "tag_id", "mode"],
+        types: &[Col::Text, Col::Text, Col::Text],
         binds_skip_json: false,
     },
     TableSpec {
@@ -439,30 +439,32 @@ pub(super) const TABLE_SPECS: &[TableSpec] = &[
         ],
         binds_skip_json: false,
     },
-    // Postgres has no citation_index column; its read path numbers citations
-    // in row order, so rows are inserted in (message_id, citation_index)
-    // order — rowid order in SQLite already matches insertion order.
     TableSpec {
         table: "chat_citations",
         source_table: "chat_citations",
-        select_exprs: "id, message_id, atom_id, chunk_index, COALESCE(excerpt, ''), \
-                       relevance_score",
+        select_exprs: "id, message_id, citation_index, atom_id, chunk_index, \
+                       COALESCE(excerpt, ''), relevance_score, \
+                       COALESCE(source_type, 'atom')",
         guard: Some("message_id IN (SELECT id FROM chat_messages)"),
         pg_cols: &[
             "id",
             "message_id",
+            "citation_index",
             "atom_id",
             "chunk_index",
             "excerpt",
             "relevance_score",
+            "source_type",
         ],
         types: &[
             Col::Text,
             Col::Text,
+            Col::Int,
             Col::Text,
             Col::Int,
             Col::Text,
             Col::Real,
+            Col::Text,
         ],
         binds_skip_json: false,
     },

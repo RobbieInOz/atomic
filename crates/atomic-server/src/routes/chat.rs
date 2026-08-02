@@ -102,9 +102,11 @@ pub async fn delete_conversation(db: Db, path: web::Path<String>) -> HttpRespons
 
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct SetScopeBody {
-    /// Tag IDs for the conversation scope
+    /// The conversation's scope. Each entry is either `{"tag_id": "...",
+    /// "mode": "include"|"require"|"exclude"}` or a bare tag id, which means
+    /// include — the shape clients sent before modes existed.
     #[serde(default)]
-    pub tag_ids: Vec<String>,
+    pub tag_ids: Vec<atomic_core::ScopeEntry>,
 }
 
 #[utoipa::path(put, path = "/api/conversations/{id}/scope", params(("id" = String, Path, description = "Conversation ID")), request_body = SetScopeBody, responses((status = 200, description = "Scope updated")), tag = "chat")]
@@ -114,14 +116,18 @@ pub async fn set_conversation_scope(
     body: web::Json<SetScopeBody>,
 ) -> HttpResponse {
     let id = path.into_inner();
-    let tag_ids = body.into_inner().tag_ids;
-    ok_or_error(db.0.set_conversation_scope(&id, &tag_ids).await)
+    let entries = body.into_inner().tag_ids;
+    ok_or_error(db.0.set_conversation_scope(&id, &entries).await)
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct AddTagBody {
     /// Tag ID to add to scope
     pub tag_id: String,
+    /// The role the tag plays: `include` (default), `require`, or `exclude`.
+    /// Re-adding a tag already in scope changes its mode.
+    #[serde(default)]
+    pub mode: atomic_core::ScopeMode,
 }
 
 #[utoipa::path(post, path = "/api/conversations/{id}/scope/tags", params(("id" = String, Path, description = "Conversation ID")), request_body = AddTagBody, responses((status = 200, description = "Tag added to scope")), tag = "chat")]
@@ -131,8 +137,8 @@ pub async fn add_tag_to_scope(
     body: web::Json<AddTagBody>,
 ) -> HttpResponse {
     let id = path.into_inner();
-    let tag_id = body.into_inner().tag_id;
-    ok_or_error(db.0.add_tag_to_scope(&id, &tag_id).await)
+    let body = body.into_inner();
+    ok_or_error(db.0.add_tag_to_scope(&id, &body.tag_id, body.mode).await)
 }
 
 #[utoipa::path(delete, path = "/api/conversations/{id}/scope/tags/{tag_id}", params(("id" = String, Path, description = "Conversation ID"), ("tag_id" = String, Path, description = "Tag ID")), responses((status = 200, description = "Tag removed from scope")), tag = "chat")]
