@@ -2147,6 +2147,39 @@ async fn admin_plane_gates_and_plan_override() {
             "admin listing shows every account: {listing}"
         );
 
+        // The detail drawer's read, on an account whose transition ledger is
+        // empty. This is the shape that regressed: the transitions SELECT is
+        // unconditional, so a column that does not exist fails the endpoint
+        // for *every* account, not just ones with history.
+        let resp = admin_get(
+            &format!("/admin/api/accounts/{}", alpha.account_id),
+            Some(alpha_session.clone()),
+        )
+        .send()
+        .await
+        .expect("send");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "account detail reads even with no plan transitions"
+        );
+        let detail: Value = resp.json().await.expect("detail json");
+        assert_eq!(detail["subdomain"], "alpha");
+        assert!(
+            detail["recent_transitions"].is_array(),
+            "detail always carries the (possibly empty) ledger: {detail}"
+        );
+
+        // An account that does not exist is a 404, not a 500.
+        let resp = admin_get(
+            "/admin/api/accounts/acct_does_not_exist",
+            Some(alpha_session.clone()),
+        )
+        .send()
+        .await
+        .expect("send");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
         // The plan picker's source of truth: the catalogue, comp included.
         let resp = admin_get("/admin/api/plans", Some(alpha_session.clone()))
             .send()
@@ -2206,6 +2239,51 @@ async fn admin_plane_gates_and_plan_override() {
         .await
         .expect("count audits");
         assert_eq!(audited, 1, "override writes the admin audit ledger");
+
+        // …and the drawer reads that ledger back. Seed an older transition so
+        // the newest-first ordering is observable, then assert the detail
+        // surfaces both, most recent first, each with its `occurred_at`
+        // rendered as the response's `at`.
+        sqlx::query(
+            "INSERT INTO plan_transitions \
+                 (account_id, from_plan_id, to_plan_id, trigger, occurred_at) \
+             VALUES ($1, 'free', 'starter', 'checkout', NOW() - interval '1 day')",
+        )
+        .bind(&bravo.account_id)
+        .execute(&mut conn)
+        .await
+        .expect("seed older transition");
+
+        let resp = admin_get(
+            &format!("/admin/api/accounts/{}", bravo.account_id),
+            Some(alpha_session.clone()),
+        )
+        .send()
+        .await
+        .expect("send");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let detail: Value = resp.json().await.expect("detail json");
+        assert_eq!(detail["plan_id"], "comp");
+        let transitions = detail["recent_transitions"]
+            .as_array()
+            .expect("recent_transitions array");
+        assert!(transitions.len() >= 2, "both ledger rows surface: {detail}");
+        assert_eq!(transitions[0]["trigger"], "admin");
+        assert_eq!(transitions[0]["to"], "comp");
+        assert_eq!(transitions[1]["trigger"], "checkout");
+        assert_eq!(transitions[1]["from"], "free");
+        let newest = chrono::DateTime::parse_from_rfc3339(
+            transitions[0]["at"].as_str().expect("at is a string"),
+        )
+        .expect("at is an rfc3339 timestamp");
+        let oldest = chrono::DateTime::parse_from_rfc3339(
+            transitions[1]["at"].as_str().expect("at is a string"),
+        )
+        .expect("at is an rfc3339 timestamp");
+        assert!(
+            newest > oldest,
+            "transitions come back newest-first by occurred_at: {detail}"
+        );
 
         // The pin holds against the trial sweep: manufacture an expired
         // trial on the comped account and run the sweep — the plan stays.
