@@ -417,12 +417,8 @@ export function MainView() {
           </div>
         )}
 
-        {/* Database switcher — the wrapper's explicit width is load-bearing:
-            the dropdown is pinned `left-0 right-0` to this box, so without it
-            the menu would size itself to the active database's name. */}
-        <div className="relative w-40 max-md:w-28 shrink-0">
-          <DatabaseSwitcher />
-        </div>
+        {/* Database switcher — icon-only trigger; owns its own dropdown anchoring. */}
+        <DatabaseSwitcher />
 
         {!isDemoInstance() && (
           <SettingsButton onClick={() => window.dispatchEvent(new CustomEvent('open-settings'))} />
