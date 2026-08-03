@@ -347,9 +347,12 @@ async fn account_detail_route(
         };
         let transitions: Vec<(Option<String>, Option<String>, String, chrono::DateTime<chrono::Utc>)> =
             sqlx::query_as(
-                "SELECT from_plan_id, to_plan_id, trigger, created_at \
+                // The ledger's timestamp is `occurred_at` (migration 010) —
+                // the audit records when the transition happened, not when
+                // the row was written. The response keeps its own name (`at`).
+                "SELECT from_plan_id, to_plan_id, trigger, occurred_at \
                  FROM plan_transitions WHERE account_id = $1 \
-                 ORDER BY created_at DESC LIMIT 10",
+                 ORDER BY occurred_at DESC LIMIT 10",
             )
             .bind(&account_id)
             .fetch_all(state.control.pool())

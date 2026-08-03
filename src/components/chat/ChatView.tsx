@@ -6,7 +6,6 @@ import { useContentSearch } from '../../hooks';
 import { ChatHeader } from './ChatHeader';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput } from './ChatInput';
-import { ChatContextChip } from './ChatContextChip';
 import { SearchBar } from '../ui/SearchBar';
 
 export function ChatView() {
@@ -211,9 +210,6 @@ export function ChatView() {
 
         <div ref={messagesEndRef} />
       </div>
-
-      {/* What the next message carries from the current page */}
-      <ChatContextChip conversationId={currentConversation.id} />
 
       {/* Input area */}
       <ChatInput

@@ -162,14 +162,6 @@ interface ChatStore {
   showArchived: boolean;
 
   /**
-   * Conversations where the user dismissed the page-context chip. Client-side
-   * and per-session by design: what the current page is has no meaning to the
-   * server between requests, so persisting the choice would outlive the
-   * context it was made about.
-   */
-  pageContextOff: Record<string, boolean>;
-
-  /**
    * Answers already saved as atoms, keyed by message id. Client-session-local
    * by design: nothing records the association server-side, so a reload
    * forgets it and the action offers to save again — which writes a second
@@ -229,9 +221,6 @@ interface ChatStore {
   updateConversationTitle: (id: string, title: string) => Promise<void>;
   setConversationArchived: (id: string, isArchived: boolean) => Promise<void>;
 
-  // Actions - Page context
-  setPageContextEnabled: (conversationId: string, enabled: boolean) => void;
-
   // Actions - Saving answers
   saveAnswer: (messageId: string) => Promise<void>;
 
@@ -290,7 +279,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   conversations: [],
   listFilterTagId: null,
   showArchived: false,
-  pageContextOff: {},
   savedAtomIdByMessageId: {},
   savingAnswerMessageIds: {},
   isLoading: false,
@@ -477,13 +465,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  // Page context
-  setPageContextEnabled: (conversationId: string, enabled: boolean) => {
-    set((state) => ({
-      pageContextOff: { ...state.pageContextOff, [conversationId]: !enabled },
-    }));
-  },
-
   // Saving answers
   saveAnswer: async (messageId: string) => {
     const { messages, currentConversation, savedAtomIdByMessageId, savingAnswerMessageIds } = get();
@@ -618,15 +599,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
       }
 
-      // Dismissing the context chip is a promise that nothing about the
-      // current page leaves with the message.
-      const sharesPageContext = !get().pageContextOff[currentConversation.id];
-
       await getTransport().invoke<ChatMessageWithContext>('send_chat_message', {
         conversationId,
         content,
         canvasContext,
-        pageContext: sharesPageContext ? buildPageContext() : undefined,
+        // Built here rather than earlier so it describes where the user is at
+        // the moment they send, not where they were when the turn began.
+        pageContext: buildPageContext(),
       });
 
       // The request returning means the turn is over, whether or not its
@@ -775,7 +754,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       conversations: [],
       listFilterTagId: null,
       showArchived: false,
-      pageContextOff: {},
       savedAtomIdByMessageId: {},
       savingAnswerMessageIds: {},
       isLoading: false,

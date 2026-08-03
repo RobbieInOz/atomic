@@ -125,12 +125,7 @@ async fn generate(
     let provider_config = ProviderConfig::from_settings(settings);
     let model = provider_config.llm_model().to_string();
     let provider = create_llm_provider(&provider_config).map_err(|e| e.to_string())?;
-    let config = LlmConfig::new(&model).with_params(
-        GenerationParams::new()
-            .with_temperature(0.3)
-            .with_max_tokens(32)
-            .with_minimize_reasoning(true),
-    );
+    let config = LlmConfig::new(&model).with_params(generation_params());
     let messages = vec![
         Message::system(TITLE_SYSTEM_PROMPT),
         Message::user(format!(
@@ -144,6 +139,18 @@ async fn generate(
         .map_err(|e| e.to_string())?;
 
     Ok(sanitize(&response.content))
+}
+
+/// The budget covers reasoning, not just the title: on reasoning models (the
+/// managed cloud's tagging tier) the completion cap is spent thinking before
+/// any visible output, and a tight cap yields finish_reason=length with empty
+/// content — every title, silently. `sanitize` bounds what we keep, so the
+/// only cost of headroom is a few thousand cheap-tier tokens.
+fn generation_params() -> GenerationParams {
+    GenerationParams::new()
+        .with_temperature(0.3)
+        .with_max_tokens(2000)
+        .with_minimize_reasoning(true)
 }
 
 fn first_message(messages: &[ChatMessageWithContext], role: &str) -> Option<String> {
@@ -188,6 +195,13 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_token_budget_leaves_room_for_reasoning() {
+        // 32 starved reasoning models into empty titles on the managed cloud;
+        // the visible output is ~20 tokens, the rest is thinking headroom.
+        assert!(generation_params().max_tokens.is_some_and(|t| t >= 1000));
+    }
 
     #[test]
     fn strips_quotes_and_trailing_punctuation() {

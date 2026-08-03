@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Database, ChevronDown, Pencil, Trash2 } from 'lucide-react';
+import { Database, Check, Pencil, Trash2 } from 'lucide-react';
 import { useDatabasesStore, DatabaseInfo } from '../stores/databases';
 
 export function DatabaseSwitcher() {
@@ -62,26 +62,31 @@ export function DatabaseSwitcher() {
   }
 
   return (
-    <div className="relative w-full min-w-0" ref={dropdownRef}>
+    <div className="relative shrink-0" ref={dropdownRef}>
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center gap-1.5 px-2 py-1.5 text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] rounded transition-colors"
-        title={activeName}
+        className="p-1.5 rounded-md text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors"
+        title={`Database: ${activeName}`}
+        aria-label={`Database: ${activeName}`}
       >
-        <Database className="w-3 h-3 flex-shrink-0 opacity-60" strokeWidth={2} />
-        <span className="truncate">{activeName}</span>
-        <ChevronDown className="w-2 h-2 flex-shrink-0 opacity-40" strokeWidth={2} />
+        <Database className="w-4 h-4" strokeWidth={2} />
       </button>
 
+      {/* Right-anchored: the trigger sits near the end of the top bar, so a
+          left-anchored menu would run off the viewport. */}
       {isOpen && (
-        <div className="absolute top-full left-0 right-0 mt-1 bg-[var(--color-bg-elevated)] border border-[var(--color-border)] rounded-lg shadow-xl z-50 py-1">
+        <div className="absolute top-full right-0 mt-1 w-56 bg-[var(--color-bg-elevated)] border border-[var(--color-border)] rounded-lg shadow-xl z-50 py-1">
           {databases.map(db => (
             <div
               key={db.id}
-              className={`flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-[var(--color-bg-hover)] ${
+              className={`group flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-[var(--color-bg-hover)] ${
                 db.id === activeId ? 'text-[var(--color-accent)]' : 'text-[var(--color-text-primary)]'
               }`}
             >
+              {/* Fixed-width slot so names stay aligned with and without the check */}
+              <span className="w-3 flex-shrink-0">
+                {db.id === activeId && <Check className="w-3 h-3" strokeWidth={2.5} />}
+              </span>
               {editingId === db.id ? (
                 <input
                   autoFocus
