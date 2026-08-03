@@ -624,6 +624,18 @@ impl SearchStore for PostgresStorage {
 
         Ok(final_results)
     }
+
+    async fn atoms_passing_scope(
+        &self,
+        atom_ids: &[String],
+        scope: &crate::search::ScopeFilter,
+    ) -> StorageResult<std::collections::HashSet<String>> {
+        if scope.is_empty() {
+            return Ok(atom_ids.iter().cloned().collect());
+        }
+        let ids: Vec<&str> = atom_ids.iter().map(String::as_str).collect();
+        pg_atoms_passing_scope(&self.pool, &ids, scope, &self.db_id).await
+    }
 }
 
 // ==================== Helper Functions ====================

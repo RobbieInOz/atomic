@@ -1,10 +1,14 @@
 import { useState } from 'react';
 import { Archive, ArchiveRestore, Pencil, Trash2 } from 'lucide-react';
-import { ConversationWithTags } from '../../stores/chat';
+import { ConversationWithTags, scopeModeOf } from '../../stores/chat';
 import { formatRelativeDate } from '../../lib/date';
 
 interface ConversationCardProps {
   conversation: ConversationWithTags;
+  /// Marks the conversation the chat pane is currently showing. Only the
+  /// sidebar list renders alongside an open conversation, so this is a no-op
+  /// in the pane's own list.
+  isActive?: boolean;
   onClick: () => void;
   onDelete: (e: React.MouseEvent) => void;
   onRename: (title: string) => void;
@@ -13,6 +17,7 @@ interface ConversationCardProps {
 
 export function ConversationCard({
   conversation,
+  isActive = false,
   onClick,
   onDelete,
   onRename,
@@ -56,7 +61,9 @@ export function ConversationCard({
   return (
     <div
       onClick={isEditingTitle ? undefined : onClick}
-      className="group px-4 py-3 hover:bg-[var(--color-bg-card)] cursor-pointer transition-colors"
+      className={`group px-4 py-3 cursor-pointer transition-colors ${
+        isActive ? 'bg-[var(--color-accent)]/20' : 'hover:bg-[var(--color-bg-card)]'
+      }`}
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
@@ -106,7 +113,7 @@ export function ConversationCard({
                 <span
                   key={tag.id}
                   className={`px-2 py-0.5 text-xs rounded ${
-                    tag.mode === 'exclude'
+                    scopeModeOf(tag) === 'exclude'
                       ? 'bg-red-500/10 text-red-300 line-through decoration-red-400/60'
                       : 'bg-[var(--color-accent)]/20 text-[var(--color-accent-light)]'
                   }`}

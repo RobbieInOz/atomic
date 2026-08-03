@@ -1,5 +1,6 @@
 //! Wiremock-backed mock of the OpenAI-compat `/v1/embeddings` and
-//! `/v1/chat/completions` endpoints.
+//! `/v1/chat/completions` endpoints, plus Ollama's `/api/embed` and
+//! `/api/chat`.
 //!
 //! The provider in `atomic-core/src/providers/openai_compat.rs` is the real
 //! reqwest client — `MockAiServer::start` just stands up an HTTP listener
@@ -7,11 +8,30 @@
 //! point at `base_url()`, then exercise the full pipeline (chunk → embed →
 //! tag → edges) against deterministic responses.
 //!
+//! ## Dialects
+//!
+//! One server speaks all three provider wire formats, so the same knobs and
+//! counters drive a test whichever provider it points at:
+//!
+//! - **OpenAI-compat** (`/v1/...`): the original surface. `OpenAICompatProvider`
+//!   hits it directly.
+//! - **OpenRouter** (`/v1/...`): byte-identical to the above — the provider
+//!   normalizes a bare `base_url` by appending `/v1`, so pointing
+//!   `openrouter_base_url` at [`MockAiServer::base_url`] lands on the same
+//!   routes.
+//! - **Ollama** (`/api/chat`, `/api/embed`): a genuinely different wire
+//!   format — NDJSON rather than SSE, tool-call arguments as JSON objects
+//!   rather than strings, no ids and no `index` on tool calls. Served by
+//!   [`OllamaChatResponder`] / [`OllamaEmbedResponder`] so agent-runtime
+//!   behavior can be proven against the framing Ollama actually produces
+//!   instead of only against the OpenAI shape.
+//!
 //! ## Mock responder modes
 //!
-//! [`ChatResponder`] currently emits **tag extraction** results keyed off
-//! the request's `response_format.json_schema.name`. Slice 3 will extend
-//! this with wiki-article and chat-tool-call modes.
+//! [`ChatResponder`] emits tag extraction, wiki/long-form, research-loop,
+//! conversation-title, and streaming agent-loop responses, keyed off the
+//! request body (see its `respond`). The Ollama responder covers the subset
+//! the chat era needs: streaming turns and conversation titles.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -27,6 +47,15 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 /// `vec_chunks float[1536]` schema so no dimension reconciliation kicks
 /// in mid-test.
 pub const EMBED_DIM: usize = 1536;
+
+/// Embedding width the **Ollama** dialect serves. Ollama's provider derives
+/// the stored width from the model *name* rather than the response
+/// (`providers::ollama::get_embedding_dimension`), whose fallback for an
+/// unregistered name is 768. A test pointing an Ollama-configured core at
+/// this mock therefore has to be embedding at 768, so `/api/embed` answers
+/// at that width — returning [`EMBED_DIM`] there would store vectors wider
+/// than the column the same config just declared.
+pub const OLLAMA_EMBED_DIM: usize = 768;
 
 /// Similarity threshold used by the pipeline when building semantic edges.
 /// Exposed here so tests can sanity-check that crafted atom pairs fall on
@@ -121,10 +150,34 @@ struct MockAiCounters {
     /// `chat_requests` because title generation is fire-and-forget: a test
     /// waits on this to know the detached task actually ran.
     title_requests: AtomicUsize,
+    /// When set, every streaming request is answered with this body verbatim
+    /// instead of a generated one — the escape hatch for pinning a parser
+    /// against wire shapes the generated responses don't produce (arguments
+    /// split across deltas, several tool calls interleaved, provider
+    /// metadata, a stream that ends without its sentinel).
+    stream_script: Mutex<Option<String>>,
     /// When set, conversation-title requests serve this failure instead of a
     /// title. Scoped to titles so the exchange that triggers one still
     /// succeeds.
     title_failure: Mutex<Option<InjectedFailure>>,
+}
+
+impl MockAiCounters {
+    /// The scripted streaming body, if one is set. Served verbatim; the
+    /// content type is the SSE one, which every dialect's parser ignores
+    /// (all three read the body as bytes and split on newlines).
+    fn scripted_stream(&self) -> Option<ResponseTemplate> {
+        let script = self
+            .stream_script
+            .lock()
+            .expect("stream_script lock")
+            .clone()?;
+        Some(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/event-stream")
+                .set_body_raw(script.into_bytes(), "text/event-stream"),
+        )
+    }
 }
 
 impl MockAiServer {
@@ -148,6 +201,25 @@ impl MockAiServer {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ChatResponder {
+                counters: counters.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        // Ollama's surface, on the same listener and the same counters: a
+        // test switches dialect by pointing `ollama_host` here instead of
+        // `openai_compat_base_url`, and every knob/assertion still applies.
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(OllamaEmbedResponder {
+                counters: counters.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaChatResponder {
                 counters: counters.clone(),
             })
             .mount(&server)
@@ -269,6 +341,27 @@ impl MockAiServer {
             .store(force, Ordering::Relaxed);
     }
 
+    /// Answer every **streaming** request with `body` verbatim, whichever
+    /// dialect's endpoint it arrives on. Clear with `None`.
+    ///
+    /// The generated streaming responses are deliberately tidy — one
+    /// complete tool call per delta, no provider metadata, always a closing
+    /// sentinel — which leaves a provider's accumulator and metadata
+    /// handling untested. This hands a test the exact bytes instead, so it
+    /// can pin what the parser does with arguments dribbled across a dozen
+    /// deltas, two tool calls interleaved by index, or a stream that simply
+    /// stops.
+    ///
+    /// The caller supplies framing: `data: {...}\n\n` for the SSE dialects,
+    /// one JSON object per line for Ollama.
+    pub fn set_stream_script(&self, body: Option<&str>) {
+        *self
+            .counters
+            .stream_script
+            .lock()
+            .expect("stream_script lock") = body.map(str::to_string);
+    }
+
     /// Conversation-title completions requested so far. Zero means the
     /// detached title task never reached the provider.
     pub fn title_request_count(&self) -> usize {
@@ -302,11 +395,19 @@ impl MockAiServer {
     }
 }
 
-/// Bag-of-words style unit-vector embedder. Two texts sharing words land
-/// at the same positions → high cosine similarity → edge crosses the 0.5
-/// threshold. Disjoint texts end up near-orthogonal.
+/// Bag-of-words style unit-vector embedder at [`EMBED_DIM`]. Two texts
+/// sharing words land at the same positions → high cosine similarity → edge
+/// crosses the 0.5 threshold. Disjoint texts end up near-orthogonal.
 fn embed_text(text: &str) -> Vec<f32> {
-    let mut vec = vec![0.0f32; EMBED_DIM];
+    embed_text_at(text, EMBED_DIM)
+}
+
+/// [`embed_text`] at an explicit width, so a dialect whose provider pins a
+/// different dimension (Ollama, [`OLLAMA_EMBED_DIM`]) gets vectors its own
+/// vector column accepts. The hashing is width-relative, so the same text
+/// still embeds deterministically — just in a different space.
+fn embed_text_at(text: &str, dim: usize) -> Vec<f32> {
+    let mut vec = vec![0.0f32; dim];
     for word in text.split_whitespace() {
         let normalized: String = word
             .chars()
@@ -318,7 +419,7 @@ fn embed_text(text: &str) -> Vec<f32> {
         }
         let mut h = DefaultHasher::new();
         normalized.hash(&mut h);
-        let idx = (h.finish() as usize) % EMBED_DIM;
+        let idx = (h.finish() as usize) % dim;
         vec[idx] += 1.0;
     }
     let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -357,6 +458,95 @@ fn streaming_chat_response(
     force_tool_calls: bool,
     tool_call: Option<(String, Value)>,
 ) -> ResponseTemplate {
+    let sse_body = match stream_leg(body, force_tool_calls, tool_call) {
+        StreamLeg::Text(fragments) => {
+            let mut chunks: Vec<Value> = fragments
+                .iter()
+                .map(|text| {
+                    json!({
+                        "choices": [{
+                            "delta": { "content": text },
+                            "finish_reason": null,
+                        }]
+                    })
+                })
+                .collect();
+            chunks.push(json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "stop",
+                }]
+            }));
+            sse_concat(&chunks)
+        }
+        StreamLeg::ToolCall {
+            id,
+            name,
+            arguments,
+        } => {
+            let chunks = [
+                json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": id,
+                                "type": "function",
+                                // OpenAI-shaped tool calls carry arguments as
+                                // a *string* of JSON, accumulated across
+                                // deltas by the provider.
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments.to_string(),
+                                }
+                            }]
+                        },
+                        "finish_reason": null,
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }]
+                }),
+            ];
+            sse_concat(&chunks)
+        }
+    };
+
+    ResponseTemplate::new(200)
+        .insert_header("Content-Type", "text/event-stream")
+        .set_body_raw(sse_body.into_bytes(), "text/event-stream")
+}
+
+/// What a streaming turn answers with, before any wire format is chosen.
+/// Shared by every dialect so the *decision* (tool call vs. prose) is one
+/// implementation and only the framing differs — which is exactly the axis
+/// a cross-provider test wants to vary.
+enum StreamLeg {
+    /// Assistant prose, pre-split into the fragments the provider should
+    /// surface as separate deltas.
+    Text(Vec<String>),
+    /// One tool call. `arguments` is the JSON *value*; each dialect encodes
+    /// it the way its wire format does (string for OpenAI, object for
+    /// Ollama).
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+}
+
+/// Pick the leg for a streaming request: a tool call while there is
+/// research to do, prose once tool results are in — or immediately when the
+/// request offers no tools at all, which is the shape of the agent loop's
+/// iteration-cap salvage call.
+fn stream_leg(
+    body: &Value,
+    force_tool_calls: bool,
+    tool_call: Option<(String, Value)>,
+) -> StreamLeg {
     let has_tool_results = body
         .get("messages")
         .and_then(|v| v.as_array())
@@ -373,85 +563,41 @@ fn streaming_chat_response(
     // Without tools on the request there is nothing to call, so the only
     // honest answer is prose — that's the shape of the agent loop's
     // no-tools salvage call.
-    let answer_with_text = !tools_offered || (has_tool_results && !force_tool_calls);
+    if !tools_offered || (has_tool_results && !force_tool_calls) {
+        // Final leg: the assistant text, split so tests exercise incremental
+        // streaming rather than one-shot content. The trailing `[1]` is the
+        // citation contract in miniature: the runtime stores only the
+        // evidence the answer actually cites, so an answer with no markers
+        // produces no citations at all.
+        return StreamLeg::Text(vec![
+            "Mock assistant reply ".to_string(),
+            "grounded in the search results. [1]".to_string(),
+        ]);
+    }
 
-    let sse_body = if answer_with_text {
-        // Final leg: emit the assistant text. Split across two deltas so
-        // tests exercise incremental streaming rather than one-shot content.
-        // The trailing `[1]` is the citation contract in miniature: the
-        // runtime stores only the evidence the answer actually cites, so an
-        // answer with no markers produces no citations at all.
-        let chunks = [
-            json!({
-                "choices": [{
-                    "delta": { "content": "Mock assistant reply " },
-                    "finish_reason": null,
-                }]
-            }),
-            json!({
-                "choices": [{
-                    "delta": { "content": "grounded in the search results. [1]" },
-                    "finish_reason": null,
-                }]
-            }),
-            json!({
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "stop",
-                }]
-            }),
-        ];
-        sse_concat(&chunks)
-    } else {
-        // First leg: ask the runtime to run a tool — `search_atoms` by
-        // default, with the query lifted from the most recent user message
-        // so the search hits the seeded atoms verbatim. The tool-call id
-        // must be unique per response — the runtime persists tool calls by
-        // this id, and concurrent conversations would otherwise collide.
-        let (tool_name, arguments) = tool_call.unwrap_or_else(|| {
-            let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
-            (
-                "search_atoms".to_string(),
-                json!({ "query": query, "limit": 5 }),
-            )
-        });
-        let arguments = arguments.to_string();
-        static TOOL_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
-        let call_id = format!(
-            "call_mock_{}_{}",
-            tool_name,
-            TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
-        let chunks = [
-            json!({
-                "choices": [{
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_name,
-                                "arguments": arguments,
-                            }
-                        }]
-                    },
-                    "finish_reason": null,
-                }]
-            }),
-            json!({
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "tool_calls",
-                }]
-            }),
-        ];
-        sse_concat(&chunks)
-    };
-
-    ResponseTemplate::new(200)
-        .insert_header("Content-Type", "text/event-stream")
-        .set_body_raw(sse_body.into_bytes(), "text/event-stream")
+    // First leg: ask the runtime to run a tool — `search_atoms` by default,
+    // with the query lifted from the most recent user message so the search
+    // hits the seeded atoms verbatim. The tool-call id must be unique per
+    // response — the runtime persists tool calls by this id, and concurrent
+    // conversations would otherwise collide.
+    let (name, arguments) = tool_call.unwrap_or_else(|| {
+        let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
+        (
+            "search_atoms".to_string(),
+            json!({ "query": query, "limit": 5 }),
+        )
+    });
+    static TOOL_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let id = format!(
+        "call_mock_{}_{}",
+        name,
+        TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    StreamLeg::ToolCall {
+        id,
+        name,
+        arguments,
+    }
 }
 
 /// Build a non-streaming `chat/completions` response for a research loop —
@@ -692,6 +838,9 @@ impl Respond for ChatResponder {
             .map(|t| !t.is_empty())
             .unwrap_or(false);
         if is_streaming {
+            if let Some(script) = self.counters.scripted_stream() {
+                return with_delay(script);
+            }
             let force = self.counters.chat_force_tool_calls.load(Ordering::Relaxed);
             let tool_call = self
                 .counters
@@ -894,4 +1043,203 @@ impl Respond for ChatResponder {
         }));
         with_delay(response)
     }
+}
+
+// ==================== Ollama dialect ====================
+
+/// `POST /api/embed` — Ollama's batch embedding endpoint. Same deterministic
+/// embedder as the OpenAI surface, at [`OLLAMA_EMBED_DIM`] (see that
+/// constant for why the width differs), and wrapped in Ollama's
+/// `{ "embeddings": [[..]] }` envelope rather than OpenAI's `data` list.
+struct OllamaEmbedResponder {
+    counters: Arc<MockAiCounters>,
+}
+
+impl Respond for OllamaEmbedResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        self.counters
+            .embedding_requests
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(failure) = *self
+            .counters
+            .embedding_failure
+            .lock()
+            .expect("embedding_failure lock")
+        {
+            return failure.response();
+        }
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return ResponseTemplate::new(400),
+        };
+        let Some(inputs) = body.get("input").and_then(|v| v.as_array()) else {
+            return ResponseTemplate::new(400);
+        };
+        let embeddings: Vec<Vec<f32>> = inputs
+            .iter()
+            .map(|text| embed_text_at(text.as_str().unwrap_or_default(), OLLAMA_EMBED_DIM))
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "model": body.get("model").cloned().unwrap_or(Value::Null),
+            "embeddings": embeddings,
+        }))
+    }
+}
+
+/// `POST /api/chat` — Ollama's single chat endpoint, streaming and not.
+///
+/// The framing is the point. Where OpenAI streams `data: {...}` SSE frames
+/// and accumulates tool-call arguments from string deltas, Ollama streams
+/// **newline-delimited JSON objects**, terminated by one carrying
+/// `done: true`, and emits each tool call complete in a single frame with
+/// its arguments as a **JSON object** and no id and no `index`. The
+/// provider synthesizes ids locally. Reproducing that faithfully is what
+/// lets an agent-runtime test prove delta emission, tool accumulation and
+/// cancellation against Ollama rather than against the OpenAI shape wearing
+/// an Ollama label.
+struct OllamaChatResponder {
+    counters: Arc<MockAiCounters>,
+}
+
+impl Respond for OllamaChatResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        self.counters.chat_requests.fetch_add(1, Ordering::Relaxed);
+        let delay = *self.counters.chat_delay.lock().expect("chat_delay lock");
+        let with_delay = |response: ResponseTemplate| match delay {
+            Some(d) => response.set_delay(d),
+            None => response,
+        };
+        if let Some(failure) = *self
+            .counters
+            .chat_failure
+            .lock()
+            .expect("chat_failure lock")
+        {
+            return with_delay(failure.response());
+        }
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return with_delay(ResponseTemplate::new(400)),
+        };
+        if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+            self.counters
+                .chat_models
+                .lock()
+                .expect("chat_models lock")
+                .push(model.to_string());
+        }
+        self.counters
+            .chat_bodies
+            .lock()
+            .expect("chat_bodies lock")
+            .push(body.clone());
+
+        if body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            if let Some(script) = self.counters.scripted_stream() {
+                return with_delay(script);
+            }
+            let force = self.counters.chat_force_tool_calls.load(Ordering::Relaxed);
+            let tool_call = self
+                .counters
+                .chat_tool_call
+                .lock()
+                .expect("chat_tool_call lock")
+                .clone();
+            return with_delay(ollama_stream_response(&body, force, tool_call));
+        }
+
+        // Conversation titles are the one non-streaming call the chat era
+        // makes, and the model it rides is provider-specific — so it has to
+        // be answerable in this dialect too. Same deliberately decorated
+        // answer as the OpenAI surface, so the same sanitizer assertions
+        // hold whichever provider produced it.
+        let request_text = body.to_string().to_lowercase();
+        if request_text.contains("conversation title") {
+            self.counters.title_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(failure) = *self
+                .counters
+                .title_failure
+                .lock()
+                .expect("title_failure lock")
+            {
+                return with_delay(failure.response());
+            }
+            return with_delay(ollama_message_response("\"Notes About Pelicans.\""));
+        }
+
+        // Anything else non-streaming (tagging's structured `format` call,
+        // the research loops' `complete_with_tools`) gets an empty, valid
+        // answer. Those surfaces are covered against the OpenAI dialect;
+        // scripting them here too would be duplicating the responder, not
+        // the coverage.
+        with_delay(ollama_message_response("{}"))
+    }
+}
+
+/// Ollama's NDJSON stream: one JSON object per line, the last carrying
+/// `done: true`. Content arrives as `message.content` fragments; tool calls
+/// arrive whole, with object-valued arguments and no ids.
+fn ollama_stream_response(
+    body: &Value,
+    force_tool_calls: bool,
+    tool_call: Option<(String, Value)>,
+) -> ResponseTemplate {
+    let mut lines: Vec<Value> = Vec::new();
+    match stream_leg(body, force_tool_calls, tool_call) {
+        StreamLeg::Text(fragments) => {
+            for text in fragments {
+                lines.push(json!({
+                    "model": "mock-ollama",
+                    "message": { "role": "assistant", "content": text },
+                    "done": false,
+                }));
+            }
+        }
+        StreamLeg::ToolCall {
+            // Ollama never sends a tool-call id; the provider mints one.
+            id: _,
+            name,
+            arguments,
+        } => {
+            lines.push(json!({
+                "model": "mock-ollama",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{ "function": { "name": name, "arguments": arguments } }],
+                },
+                "done": false,
+            }));
+        }
+    }
+    // The terminating frame. The provider stops reading at the first
+    // `done: true`, so nothing may follow it.
+    lines.push(json!({
+        "model": "mock-ollama",
+        "message": { "role": "assistant", "content": "" },
+        "done": true,
+        "done_reason": "stop",
+    }));
+
+    let ndjson = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    ResponseTemplate::new(200)
+        .insert_header("Content-Type", "application/x-ndjson")
+        .set_body_raw(ndjson.into_bytes(), "application/x-ndjson")
+}
+
+/// A non-streaming Ollama `/api/chat` answer carrying prose.
+fn ollama_message_response(content: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "model": "mock-ollama",
+        "message": { "role": "assistant", "content": content },
+        "done": true,
+        "done_reason": "stop",
+    }))
 }

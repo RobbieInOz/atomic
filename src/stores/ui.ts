@@ -105,6 +105,9 @@ interface UIStore {
   leftPanelOpen: boolean;
   // Chat sidebar state
   chatSidebarOpen: boolean;
+  /// Desktop only: the chat pane takes the whole main view. Independent of
+  /// `chatSidebarWidth`, which keeps the width to restore on minimize.
+  chatSidebarExpanded: boolean;
   chatSidebarWidth: number;
   chatSidebarConversationId: string | null;
   chatSidebarInitialTagId: string | null;
@@ -171,6 +174,8 @@ interface UIStore {
   // Chat sidebar actions
   toggleChatSidebar: () => void;
   setChatSidebarOpen: (open: boolean) => void;
+  setChatSidebarExpanded: (expanded: boolean) => void;
+  toggleChatSidebarExpanded: () => void;
   setChatSidebarWidth: (width: number) => void;
   setChatSidebarConversationId: (id: string | null) => void;
   openChatSidebar: (tagId?: string, conversationId?: string) => void;
@@ -197,6 +202,15 @@ interface UIStore {
   setReaderTheme: (theme: 'light' | 'dark') => void;
   toggleReaderTheme: () => void;
 }
+
+/// Fullscreen chat is a mode, not a destination: whenever the user navigates
+/// the main view they mean to look at it, so every navigating action folds
+/// this into its `set` rather than each call site remembering to.
+///
+/// Exported because the store's actions aren't the only way the main view
+/// changes — browser Back/Forward reconciles the store from the URL in
+/// `RouterBridge`, which has to make the same promise.
+export const LEAVE_FULLSCREEN_CHAT = { chatSidebarExpanded: false } as const;
 
 /// Generate a tab id. Falls back to a monotonic counter for environments
 /// without crypto.randomUUID (older mobile webviews).
@@ -342,6 +356,7 @@ export const useUIStore = create<UIStore>()(
       highlightedAtomId: null,
       leftPanelOpen: true,
       chatSidebarOpen: false,
+      chatSidebarExpanded: false,
       chatSidebarWidth: 480,
       chatSidebarConversationId: null,
       chatSidebarInitialTagId: null,
@@ -358,7 +373,7 @@ export const useUIStore = create<UIStore>()(
       setServerConnected: (connected: boolean) => set({ serverConnected: connected }),
 
       setSelectedTag: (tagId: string | null) => {
-        set({ selectedTagId: tagId });
+        set({ selectedTagId: tagId, ...LEAVE_FULLSCREEN_CHAT });
         const state = get();
         const activeTab = state.activeTabId ? state.tabs.find((t) => t.id === state.activeTabId) : null;
         const activeEntry = activeTab?.stack[activeTab.stackIndex] ?? null;
@@ -413,6 +428,7 @@ export const useUIStore = create<UIStore>()(
               tabs: [...s.tabs, tab],
               activeTabId: id,
               nextTabOrdinal: s.nextTabOrdinal + 1,
+              ...LEAVE_FULLSCREEN_CHAT,
               ...projected,
               localGraph: { ...s.localGraph, ...projected.localGraphPatch },
             };
@@ -433,6 +449,7 @@ export const useUIStore = create<UIStore>()(
             const projected = projectActiveEntry(entry);
             return {
               tabs,
+              ...LEAVE_FULLSCREEN_CHAT,
               ...projected,
               localGraph: { ...s.localGraph, ...projected.localGraphPatch },
             };
@@ -480,6 +497,7 @@ export const useUIStore = create<UIStore>()(
             return {
               tabs,
               activeTabId: existingId,
+              ...LEAVE_FULLSCREEN_CHAT,
               ...projected,
               localGraph: { ...s.localGraph, ...projected.localGraphPatch },
             };
@@ -497,6 +515,7 @@ export const useUIStore = create<UIStore>()(
             tabs: [...s.tabs, tab],
             activeTabId: id,
             nextTabOrdinal: s.nextTabOrdinal + 1,
+            ...LEAVE_FULLSCREEN_CHAT,
             ...projected,
             localGraph: { ...s.localGraph, ...projected.localGraphPatch },
           };
@@ -514,6 +533,7 @@ export const useUIStore = create<UIStore>()(
         const projected = projectActiveEntry(entry);
         set((s) => ({
           activeTabId: tabId,
+          ...LEAVE_FULLSCREEN_CHAT,
           ...projected,
           localGraph: { ...s.localGraph, ...projected.localGraphPatch },
         }));
@@ -580,6 +600,7 @@ export const useUIStore = create<UIStore>()(
         const projected = projectActiveEntry(entry);
         set((s) => ({
           tabs: s.tabs.map((t) => (t.id === tab.id ? { ...t, stackIndex: newIndex } : t)),
+          ...LEAVE_FULLSCREEN_CHAT,
           ...projected,
           localGraph: { ...s.localGraph, ...projected.localGraphPatch },
         }));
@@ -596,6 +617,7 @@ export const useUIStore = create<UIStore>()(
         const projected = projectActiveEntry(entry);
         set((s) => ({
           tabs: s.tabs.map((t) => (t.id === tab.id ? { ...t, stackIndex: newIndex } : t)),
+          ...LEAVE_FULLSCREEN_CHAT,
           ...projected,
           localGraph: { ...s.localGraph, ...projected.localGraphPatch },
         }));
@@ -847,8 +869,19 @@ export const useUIStore = create<UIStore>()(
 
       // -- Chat sidebar --------------------------------------------------
 
-      toggleChatSidebar: () => set((state) => ({ chatSidebarOpen: !state.chatSidebarOpen })),
-      setChatSidebarOpen: (open: boolean) => set({ chatSidebarOpen: open }),
+      // Closing the pane also leaves fullscreen: reopening it should give the
+      // user the sidebar they closed, not an unexpected takeover.
+      toggleChatSidebar: () =>
+        set((state) =>
+          state.chatSidebarOpen
+            ? { chatSidebarOpen: false, ...LEAVE_FULLSCREEN_CHAT }
+            : { chatSidebarOpen: true },
+        ),
+      setChatSidebarOpen: (open: boolean) =>
+        set(open ? { chatSidebarOpen: true } : { chatSidebarOpen: false, ...LEAVE_FULLSCREEN_CHAT }),
+      setChatSidebarExpanded: (expanded: boolean) => set({ chatSidebarExpanded: expanded }),
+      toggleChatSidebarExpanded: () =>
+        set((state) => ({ chatSidebarExpanded: !state.chatSidebarExpanded })),
       setChatSidebarWidth: (width: number) => set({ chatSidebarWidth: Math.min(Math.max(width, 320), 800) }),
       setChatSidebarConversationId: (id: string | null) => set({ chatSidebarConversationId: id }),
       openChatSidebar: (tagId?: string, conversationId?: string) =>
@@ -869,6 +902,7 @@ export const useUIStore = create<UIStore>()(
         const projected = wasInTab ? projectActiveEntry(null) : null;
         set((s) => ({
           viewMode: mode,
+          ...LEAVE_FULLSCREEN_CHAT,
           ...(wasInTab
             ? {
                 activeTabId: null,
@@ -1015,6 +1049,7 @@ export const useUIStore = create<UIStore>()(
         atomsLayout: state.atomsLayout,
         readerTheme: state.readerTheme,
         chatSidebarOpen: state.chatSidebarOpen,
+        chatSidebarExpanded: state.chatSidebarExpanded,
         chatSidebarWidth: state.chatSidebarWidth,
         chatSidebarConversationId: state.chatSidebarConversationId,
         leftPanelOpen: state.leftPanelOpen,

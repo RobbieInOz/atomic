@@ -4,6 +4,8 @@ import type { ViewMode } from '../../stores/ui';
 
 function input(overrides: Partial<SidebarContextInput> = {}): SidebarContextInput {
   return {
+    chatSidebarOpen: false,
+    chatSidebarExpanded: false,
     localGraph: { isOpen: false },
     readerState: { atomId: null },
     wikiReaderState: { tagId: null },
@@ -49,6 +51,27 @@ describe('deriveSidebarContext', () => {
       kind: 'findings',
       reportId: 'r1',
     });
+  });
+
+  it('shows conversations while the chat pane is expanded, whatever else is open', () => {
+    const fullscreen: SidebarContextInput = input({
+      chatSidebarOpen: true,
+      chatSidebarExpanded: true,
+      localGraph: { isOpen: true },
+      readerState: { atomId: 'a1' },
+      reportsDetailState: { reportId: 'r1' },
+      viewMode: 'wiki',
+    });
+    expect(deriveSidebarContext(fullscreen)).toEqual({ kind: 'conversations' });
+  });
+
+  it('ignores an expanded flag while the chat pane is closed', () => {
+    expect(
+      deriveSidebarContext(input({ chatSidebarExpanded: true, chatSidebarOpen: false, viewMode: 'wiki' })),
+    ).toEqual({ kind: 'wiki-list' });
+    expect(
+      deriveSidebarContext(input({ chatSidebarExpanded: false, chatSidebarOpen: true, viewMode: 'wiki' })),
+    ).toEqual({ kind: 'wiki-list' });
   });
 
   it('keeps the tag tree while the local graph is open', () => {

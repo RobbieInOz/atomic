@@ -53,6 +53,19 @@ impl SqliteStorage {
         crate::chat::update_conversation(&conn, id, title, is_archived)
     }
 
+    pub(crate) fn set_conversation_title_if_unset_sync(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        crate::chat::set_title_if_unset(&conn, id, title)
+    }
+
     pub(crate) fn delete_conversation_sync(&self, id: &str) -> StorageResult<()> {
         let conn = self
             .db
@@ -242,6 +255,21 @@ impl ChatStore for SqliteStorage {
         let title = title.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             storage.update_conversation_sync(&id, title.as_deref(), is_archived)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn set_conversation_title_if_unset(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool> {
+        let storage = self.clone();
+        let id = id.to_string();
+        let title = title.to_string();
+        tokio::task::spawn_blocking(move || {
+            storage.set_conversation_title_if_unset_sync(&id, &title)
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?

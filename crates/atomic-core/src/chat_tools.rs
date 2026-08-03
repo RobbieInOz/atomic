@@ -10,7 +10,7 @@
 //! and put the number they get back into their own output — that number is
 //! the `[N]` the model must write for the source to reach the user.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -81,6 +81,10 @@ impl ChatToolset {
             ),
             on_event: Arc::clone(&self.on_event),
         };
+        let guard = ScopeGuard {
+            storage: self.storage.clone(),
+            scope: self.scope.clone(),
+        };
 
         let mut registry = ToolRegistry::new()
             .with(SearchAtoms {
@@ -89,19 +93,19 @@ impl ChatToolset {
                 scope: self.scope,
             })
             .with(GetAtom {
-                storage: self.storage.clone(),
+                guard: guard.clone(),
             })
             .with(ListTags {
-                storage: self.storage.clone(),
+                guard: guard.clone(),
             })
             .with(GetWiki {
-                storage: self.storage.clone(),
+                guard: guard.clone(),
             })
             .with(ListReports {
-                storage: self.storage.clone(),
+                guard: guard.clone(),
             })
             .with(GetFinding {
-                storage: self.storage.clone(),
+                guard: guard.clone(),
             })
             .with(CreateAtom {
                 deps: mutations.clone(),
@@ -110,7 +114,7 @@ impl ChatToolset {
 
         if let Some(page_context) = self.page_context {
             registry.register(CurrentPageContext {
-                storage: self.storage,
+                guard,
                 page_context,
             });
         }
@@ -148,6 +152,189 @@ fn embedding_event_bridge(
 
 fn excerpt(text: &str) -> String {
     text.chars().take(EXCERPT_LEN).collect()
+}
+
+// ==================== Scope enforcement ====================
+
+/// The conversation's scope, applied to the tools that read *by id*.
+///
+/// `search_atoms` carries its scope into the query, so nothing outside it can
+/// come back. Every other reading tool is handed an id — an atom's, a tag's,
+/// a finding's — and would otherwise fetch it unconditionally, which turns
+/// the system prompt's promise that excluded tags "will never appear" into a
+/// suggestion. Each of them asks this guard first and refuses in plain
+/// language when the answer is no, so the model learns the boundary instead
+/// of retrying against it.
+#[derive(Clone)]
+struct ScopeGuard {
+    storage: StorageBackend,
+    scope: ScopeFilter,
+}
+
+impl ScopeGuard {
+    /// Which of `atom_ids` the scope admits. An empty scope admits
+    /// everything without touching storage.
+    async fn admitted_atoms(&self, atom_ids: &[String]) -> Result<HashSet<String>, String> {
+        if self.scope.is_empty() || atom_ids.is_empty() {
+            return Ok(atom_ids.iter().cloned().collect());
+        }
+        self.storage
+            .atoms_passing_scope_sync(atom_ids, &self.scope)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn admits_atom(&self, atom_id: &str) -> Result<bool, String> {
+        let ids = vec![atom_id.to_string()];
+        Ok(self.admitted_atoms(&ids).await?.contains(atom_id))
+    }
+
+    /// Resolve the scope against a tag tree, once per call that needs it.
+    fn tags(&self, tree: &[TagWithCount]) -> TagScope {
+        TagScope::resolve(tree, &self.scope)
+    }
+}
+
+/// The scope as it applies to tags, resolved against one tag tree.
+///
+/// Two questions, because they have different answers. *Readable* is whether
+/// the tag's content — its wiki article — may be handed to the model:
+/// evaluated with [`ScopeFilter::admitted`], the same predicate the atom
+/// paths use, over the scope roots covering each tag. *Listable* is whether
+/// `list_tags` may name it: excluded branches are hidden outright, and an
+/// include scope narrows the listing to those branches plus the ancestors
+/// they hang from, so the model still sees where they sit.
+enum TagScope {
+    /// No scope at all — every tag is both readable and listable.
+    Open,
+    Filtered {
+        readable: HashSet<String>,
+        listable: HashSet<String>,
+    },
+}
+
+impl TagScope {
+    fn resolve(tree: &[TagWithCount], scope: &ScopeFilter) -> Self {
+        if scope.is_empty() {
+            return TagScope::Open;
+        }
+
+        let TagCoverage {
+            covering,
+            include_ancestors,
+            ..
+        } = TagCoverage::of(tree, scope);
+
+        let ids: Vec<String> = covering.keys().cloned().collect();
+        let readable = scope.admitted(ids.iter().map(String::as_str), &covering);
+
+        let covered_by = |id: &str, list: &[String]| {
+            covering
+                .get(id)
+                .is_some_and(|roots| list.iter().any(|tag| roots.contains(tag)))
+        };
+        let listable = ids
+            .iter()
+            .filter(|id| !covered_by(id, &scope.exclude))
+            .filter(|id| {
+                scope.include.is_empty()
+                    || covered_by(id, &scope.include)
+                    || include_ancestors.contains(*id)
+            })
+            .cloned()
+            .collect();
+
+        TagScope::Filtered { readable, listable }
+    }
+
+    fn readable(&self, tag_id: &str) -> bool {
+        match self {
+            TagScope::Open => true,
+            TagScope::Filtered { readable, .. } => readable.contains(tag_id),
+        }
+    }
+
+    fn listable(&self, tag_id: &str) -> bool {
+        match self {
+            TagScope::Open => true,
+            TagScope::Filtered { listable, .. } => listable.contains(tag_id),
+        }
+    }
+
+    /// The tree with every non-listable tag — and the branch beneath it —
+    /// removed. `children_total` is recounted so the "N sub-tags" pointer
+    /// doesn't advertise branches this conversation can't open.
+    fn prune(&self, nodes: &[TagWithCount]) -> Vec<TagWithCount> {
+        if matches!(self, TagScope::Open) {
+            return nodes.to_vec();
+        }
+        nodes
+            .iter()
+            .filter(|node| self.listable(&node.tag.id))
+            .map(|node| {
+                let children = self.prune(&node.children);
+                TagWithCount {
+                    tag: node.tag.clone(),
+                    atom_count: node.atom_count,
+                    children_total: children.len() as i32,
+                    children,
+                }
+            })
+            .collect()
+    }
+}
+
+/// One walk of the tag tree, recording per tag the scope roots covering it —
+/// itself or any ancestor — plus the ancestors of every include root, which a
+/// listing keeps so admitted branches still have a tree to hang from.
+struct TagCoverage {
+    roots: HashSet<String>,
+    include_roots: HashSet<String>,
+    covering: HashMap<String, HashSet<String>>,
+    include_ancestors: HashSet<String>,
+}
+
+impl TagCoverage {
+    fn of(tree: &[TagWithCount], scope: &ScopeFilter) -> Self {
+        let mut coverage = TagCoverage {
+            roots: scope.roots().into_iter().collect(),
+            include_roots: scope.include.iter().cloned().collect(),
+            covering: HashMap::new(),
+            include_ancestors: HashSet::new(),
+        };
+        coverage.walk(tree, &HashSet::new(), &[]);
+        coverage
+    }
+
+    fn walk(&mut self, nodes: &[TagWithCount], inherited: &HashSet<String>, path: &[String]) {
+        for node in nodes {
+            let id = &node.tag.id;
+            let mut mine = inherited.clone();
+            if self.roots.contains(id) {
+                mine.insert(id.clone());
+            }
+            if self.include_roots.contains(id) {
+                self.include_ancestors.extend(path.iter().cloned());
+            }
+            self.covering.insert(id.clone(), mine.clone());
+
+            let mut child_path = path.to_vec();
+            child_path.push(id.clone());
+            self.walk(&node.children, &mine, &child_path);
+        }
+    }
+}
+
+/// What a tool says when the scope won't let it read something. Names the
+/// boundary without describing what is behind it, and tells the model the
+/// refusal is final so it stops re-asking.
+fn out_of_scope(subject: &str) -> String {
+    format!(
+        "{} is outside this conversation's scope, so it can't be read here. \
+         The scope is fixed for this conversation — work from what is in scope, \
+         or tell the user what you would need them to add.",
+        subject
+    )
 }
 
 /// Lead a tool result with the number the model must cite, or with nothing
@@ -218,31 +405,53 @@ fn paging_args(args: &serde_json::Value) -> (usize, usize) {
     (offset, limit)
 }
 
+/// One window of content, split into what the model reads and what a
+/// citation quotes.
+struct LineWindow {
+    /// What the model is shown: the lines, led by a header explaining how to
+    /// read the rest whenever the content didn't fit in one call.
+    rendered: String,
+    /// The lines alone. Excerpts come from here, so a citation stored
+    /// alongside a paginated read quotes the source rather than the
+    /// bookkeeping line above it.
+    body: String,
+}
+
 /// A window of `limit` lines starting at `offset`, headed by how to read the
 /// rest through `tool`. Short content (the common case) comes back clean,
 /// with no metadata noise.
-fn line_window(content: &str, offset: usize, limit: usize, tool: &str) -> String {
+fn line_window(content: &str, offset: usize, limit: usize, tool: &str) -> LineWindow {
+    let plain = |text: String| LineWindow {
+        body: text.clone(),
+        rendered: text,
+    };
+
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
 
     // Empty content — return empty before the range math, otherwise a
     // nonzero offset would produce lines[offset..0] and panic.
     if total == 0 {
-        return String::new();
+        return plain(String::new());
     }
 
     if offset >= total {
-        return format!(
-            "[offset={} is past end of content ({} total lines)]",
-            offset, total
-        );
+        // Nothing was read, so there is nothing to quote: the notice is
+        // rendered but never becomes an excerpt.
+        return LineWindow {
+            rendered: format!(
+                "[offset={} is past end of content ({} total lines)]",
+                offset, total
+            ),
+            body: String::new(),
+        };
     }
 
     let end = (offset + limit).min(total);
-    let slice = lines[offset..end].join("\n");
+    let body = lines[offset..end].join("\n");
 
     if offset == 0 && end == total {
-        return slice;
+        return plain(body);
     }
 
     let header = if end < total {
@@ -264,7 +473,10 @@ fn line_window(content: &str, offset: usize, limit: usize, tool: &str) -> String
         )
     };
 
-    format!("{}{}", header, slice)
+    LineWindow {
+        rendered: format!("{}{}", header, body),
+        body,
+    }
 }
 
 /// Find a tag by id, then by exact name, then case-insensitively — the same
@@ -446,7 +658,7 @@ async fn search_atoms(
 // ==================== get_atom ====================
 
 struct GetAtom {
-    storage: StorageBackend,
+    guard: ScopeGuard,
 }
 
 #[async_trait]
@@ -471,17 +683,31 @@ impl AgentTool for GetAtom {
         let atom_id = args["atom_id"].as_str().unwrap_or("");
         let (offset, limit) = paging_args(args);
 
-        match read_atom_lines(&self.storage, atom_id, offset, limit).await {
-            Ok(Some(content)) => {
-                let number =
-                    ctx.citations
-                        .register(CitationSource::Atom, atom_id, None, excerpt(&content));
+        // Scope first: an id the model got from anywhere — a wiki article, a
+        // report listing, its own memory of an earlier conversation — must
+        // not become a way around the conversation's scope.
+        match self.guard.admits_atom(atom_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return ToolResult::ok(out_of_scope(&format!("Atom {}", atom_id)), 0);
+            }
+            Err(e) => return ToolResult::failed(e),
+        }
+
+        match read_atom_lines(&self.guard.storage, atom_id, offset, limit).await {
+            Ok(Some(window)) => {
+                let number = ctx.citations.register(
+                    CitationSource::Atom,
+                    atom_id,
+                    None,
+                    excerpt(&window.body),
+                );
                 ToolResult::ok(
                     format!(
                         "{}(atom_id: {})\n{}",
                         citation_marker(number),
                         atom_id,
-                        content
+                        window.rendered
                     ),
                     1,
                 )
@@ -497,7 +723,7 @@ async fn read_atom_lines(
     atom_id: &str,
     offset: usize,
     limit: usize,
-) -> Result<Option<String>, String> {
+) -> Result<Option<LineWindow>, String> {
     let Some(content) = storage
         .get_atom_content_impl(atom_id)
         .await
@@ -515,7 +741,7 @@ async fn read_atom_lines(
 /// sits under each. Purely navigational — a tag is not a source, so nothing
 /// here is citable.
 struct ListTags {
-    storage: StorageBackend,
+    guard: ScopeGuard,
 }
 
 #[async_trait]
@@ -537,21 +763,34 @@ impl AgentTool for ListTags {
     }
 
     async fn execute(&self, args: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolResult {
-        let tree = match self.storage.get_all_tags_impl().await {
+        let tree = match self.guard.storage.get_all_tags_impl().await {
             Ok(tree) => tree,
             Err(e) => return ToolResult::failed(e),
         };
+        // The listing is the map the model navigates by. Handing it branches
+        // the scope has closed invites a get_wiki or get_atom call that can
+        // only be refused, and names topics the user asked to keep out.
+        let scope = self.guard.tags(&tree);
+        let visible = scope.prune(&tree);
 
         let parent = args
             .get("parent_id")
             .and_then(|v| v.as_str())
             .filter(|value| !value.is_empty());
         let (heading, roots) = match parent {
+            // Resolved against the full tree so an in-scope name and an
+            // out-of-scope one get different answers.
             Some(needle) => match resolve_tag(&tree, needle) {
-                Some(tag) => (
-                    format!("Sub-tags of {} (counts include sub-tags):", tag.tag.name),
-                    std::slice::from_ref(tag),
-                ),
+                Some(tag) if !scope.listable(&tag.tag.id) => {
+                    return ToolResult::ok(out_of_scope(&format!("'{}'", tag.tag.name)), 0)
+                }
+                Some(tag) => match resolve_tag(&visible, &tag.tag.id) {
+                    Some(pruned) => (
+                        format!("Sub-tags of {} (counts include sub-tags):", pruned.tag.name),
+                        std::slice::from_ref(pruned),
+                    ),
+                    None => return ToolResult::ok(out_of_scope(&format!("'{}'", tag.tag.name)), 0),
+                },
                 None => {
                     return ToolResult::ok(
                         format!("No tag matches '{}'. Call list_tags with no arguments to see the top of the tree.", needle),
@@ -561,12 +800,19 @@ impl AgentTool for ListTags {
             },
             None => (
                 "Tags (counts include sub-tags):".to_string(),
-                tree.as_slice(),
+                visible.as_slice(),
             ),
         };
 
         if roots.is_empty() {
-            return ToolResult::ok("This knowledge base has no tags yet.", 0);
+            return ToolResult::ok(
+                if tree.is_empty() {
+                    "This knowledge base has no tags yet."
+                } else {
+                    "No tags are within this conversation's scope."
+                },
+                0,
+            );
         }
 
         let mut out = heading;
@@ -614,7 +860,7 @@ fn render_tags(nodes: &[TagWithCount], depth: usize, out: &mut String, rendered:
 /// The synthesized article for a tag — the one place the knowledge base
 /// already answers "what do I know about X?" in prose.
 struct GetWiki {
-    storage: StorageBackend,
+    guard: ScopeGuard,
 }
 
 #[async_trait]
@@ -641,7 +887,7 @@ impl AgentTool for GetWiki {
             return ToolResult::failed("tag is required");
         }
 
-        let tree = match self.storage.get_all_tags_impl().await {
+        let tree = match self.guard.storage.get_all_tags_impl().await {
             Ok(tree) => tree,
             Err(e) => return ToolResult::failed(e),
         };
@@ -655,7 +901,18 @@ impl AgentTool for GetWiki {
             );
         };
 
-        let wiki = match self.storage.get_wiki_sync(&tag.tag.id).await {
+        // An article is the densest read in the knowledge base — a whole
+        // tag's worth of atoms in prose. A scope that closes the tag has to
+        // close the article with it, or excluding a topic would mean nothing
+        // more than excluding its atoms from search.
+        if !self.guard.tags(&tree).readable(&tag.tag.id) {
+            return ToolResult::ok(
+                out_of_scope(&format!("The wiki article for '{}'", tag.tag.name)),
+                0,
+            );
+        }
+
+        let wiki = match self.guard.storage.get_wiki_sync(&tag.tag.id).await {
             Ok(Some(wiki)) => wiki,
             Ok(None) => {
                 return ToolResult::ok(
@@ -670,15 +927,18 @@ impl AgentTool for GetWiki {
         };
 
         let (offset, limit) = paging_args(args);
-        let content = line_window(
+        let window = line_window(
             &strip_citation_markers(&wiki.article.content),
             offset,
             limit,
             "get_wiki",
         );
-        let number =
-            ctx.citations
-                .register(CitationSource::Wiki, &tag.tag.id, None, excerpt(&content));
+        let number = ctx.citations.register(
+            CitationSource::Wiki,
+            &tag.tag.id,
+            None,
+            excerpt(&window.body),
+        );
         ToolResult::ok(
             format!(
                 "{}(wiki article for tag: {}, tag_id: {}, {} atoms, updated {})\n{}",
@@ -687,7 +947,7 @@ impl AgentTool for GetWiki {
                 tag.tag.id,
                 wiki.article.atom_count,
                 wiki.article.updated_at,
-                content
+                window.rendered
             ),
             1,
         )
@@ -699,7 +959,7 @@ impl AgentTool for GetWiki {
 /// What the user's scheduled research has been looking into, and when it
 /// last reported back.
 struct ListReports {
-    storage: StorageBackend,
+    guard: ScopeGuard,
 }
 
 #[async_trait]
@@ -717,7 +977,7 @@ impl AgentTool for ListReports {
     }
 
     async fn execute(&self, _args: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolResult {
-        let reports = match self.storage.list_reports_sync().await {
+        let reports = match self.guard.storage.list_reports_sync().await {
             Ok(reports) => reports,
             Err(e) => return ToolResult::failed(e),
         };
@@ -726,9 +986,39 @@ impl AgentTool for ListReports {
         }
 
         let total = reports.len();
+        let listed: Vec<_> = reports.into_iter().take(MAX_REPORTS).collect();
+
+        // One finding each: the list is a menu, and get_finding is how the
+        // model reads the thing it picks. Loaded up front so the scope check
+        // over all of them is a single query.
+        let mut latest = Vec::with_capacity(listed.len());
+        for report in &listed {
+            latest.push(
+                self.guard
+                    .storage
+                    .list_findings_for_report_sync(&report.id, 1)
+                    .await
+                    .map(|findings| findings.into_iter().next()),
+            );
+        }
+        let finding_atom_ids: Vec<String> = latest
+            .iter()
+            .filter_map(|result| result.as_ref().ok()?.as_ref())
+            .map(|(_, atom)| atom.atom.id.clone())
+            .collect();
+        // A report's scope and the conversation's are independent, so a
+        // finding can sit outside this conversation entirely. The report
+        // itself stays listed — its name and schedule are configuration, not
+        // knowledge — but the finding's title and id do not, or the listing
+        // becomes the index into content the scope closed.
+        let admitted = match self.guard.admitted_atoms(&finding_atom_ids).await {
+            Ok(admitted) => admitted,
+            Err(e) => return ToolResult::failed(e),
+        };
+
         let mut out = String::new();
         let mut count = 0;
-        for report in reports.into_iter().take(MAX_REPORTS) {
+        for (report, finding) in listed.into_iter().zip(latest) {
             count += 1;
             out.push_str(&format!(
                 "{} (report_id: {}, schedule: {}{})",
@@ -740,15 +1030,9 @@ impl AgentTool for ListReports {
             if let Some(description) = report.description.as_deref().filter(|d| !d.is_empty()) {
                 out.push_str(&format!("\n  {}", description));
             }
-            // One finding each: the list is a menu, and get_finding is how
-            // the model reads the thing it picks.
-            match self
-                .storage
-                .list_findings_for_report_sync(&report.id, 1)
-                .await
-            {
-                Ok(findings) => match findings.first() {
-                    Some((finding, atom)) => out.push_str(&format!(
+            match finding {
+                Ok(Some((finding, atom))) if admitted.contains(&atom.atom.id) => {
+                    out.push_str(&format!(
                         "\n  latest finding: {} ({}, atom_id: {})",
                         if atom.atom.title.is_empty() {
                             "(untitled)"
@@ -757,9 +1041,12 @@ impl AgentTool for ListReports {
                         },
                         finding.created_at,
                         atom.atom.id
-                    )),
-                    None => out.push_str("\n  no findings yet"),
-                },
+                    ))
+                }
+                Ok(Some(_)) => {
+                    out.push_str("\n  latest finding: outside this conversation's scope")
+                }
+                Ok(None) => out.push_str("\n  no findings yet"),
                 Err(e) => out.push_str(&format!("\n  (could not load findings: {})", e)),
             }
             out.push_str("\n\n");
@@ -775,7 +1062,7 @@ impl AgentTool for ListReports {
 /// One finding in full. Findings are atoms of kind `report`, so this is the
 /// atom read path with the provenance the finding reader shows.
 struct GetFinding {
-    storage: StorageBackend,
+    guard: ScopeGuard,
 }
 
 #[async_trait]
@@ -798,7 +1085,17 @@ impl AgentTool for GetFinding {
 
     async fn execute(&self, args: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolResult {
         let atom_id = args["atom_id"].as_str().unwrap_or("");
-        let finding = match self.storage.get_atom_impl(atom_id).await {
+
+        // Findings are atoms, so they are scoped like atoms — and this is the
+        // tool the list_reports menu points at, which makes it the obvious
+        // way around a scope if it doesn't check.
+        match self.guard.admits_atom(atom_id).await {
+            Ok(true) => {}
+            Ok(false) => return ToolResult::ok(out_of_scope("That finding"), 0),
+            Err(e) => return ToolResult::failed(e),
+        }
+
+        let finding = match self.guard.storage.get_atom_impl(atom_id).await {
             Ok(Some(finding)) => finding,
             Ok(None) => return ToolResult::ok("Finding not found", 0),
             Err(e) => return ToolResult::failed(e),
@@ -814,6 +1111,7 @@ impl AgentTool for GetFinding {
         }
 
         let provenance = self
+            .guard
             .storage
             .get_finding_provenance_sync(atom_id)
             .await
@@ -824,15 +1122,18 @@ impl AgentTool for GetFinding {
             .unwrap_or("(unknown report)");
 
         let (offset, limit) = paging_args(args);
-        let content = line_window(
+        let window = line_window(
             &strip_citation_markers(&finding.atom.content),
             offset,
             limit,
             "get_finding",
         );
-        let number =
-            ctx.citations
-                .register(CitationSource::Finding, atom_id, None, excerpt(&content));
+        let number = ctx.citations.register(
+            CitationSource::Finding,
+            atom_id,
+            None,
+            excerpt(&window.body),
+        );
         ToolResult::ok(
             format!(
                 "{}(finding from report: {}, atom_id: {}, created {})\n{}",
@@ -840,7 +1141,7 @@ impl AgentTool for GetFinding {
                 report_name,
                 atom_id,
                 finding.atom.created_at,
-                content
+                window.rendered
             ),
             1,
         )
@@ -1181,7 +1482,7 @@ async fn enqueue_and_process_pipeline(
 // ==================== get_current_page_context ====================
 
 struct CurrentPageContext {
-    storage: StorageBackend,
+    guard: ScopeGuard,
     page_context: PageContext,
 }
 
@@ -1203,10 +1504,11 @@ impl AgentTool for CurrentPageContext {
         let page = &self.page_context;
         let mut visible_atom = serde_json::Value::Null;
         if let Some(atom_id) = page.atom_id.as_deref().filter(|id| !id.is_empty()) {
-            let stored = match self.storage.get_atom_impl(atom_id).await {
+            let stored = match self.guard.storage.get_atom_impl(atom_id).await {
                 Ok(stored) => stored,
                 Err(e) => return ToolResult::failed(e),
             };
+            let found = stored.is_some();
             visible_atom = match stored {
                 Some(atom_with_tags) => json!({
                     "id": atom_with_tags.atom.id,
@@ -1227,11 +1529,23 @@ impl AgentTool for CurrentPageContext {
                 }),
             };
 
+            // What the user is looking at reaches the model because the user
+            // shared it — the context chip is that consent, per message. A
+            // *citation* is a different claim: it says the answer stands on a
+            // source this conversation is allowed to draw on. An atom the
+            // scope excludes isn't, and neither is one the frontend named
+            // that no longer exists — citing either would put a source in the
+            // answer that nothing can open.
+            let citable = found
+                && match self.guard.admits_atom(atom_id).await {
+                    Ok(admitted) => admitted,
+                    Err(e) => return ToolResult::failed(e),
+                };
             let snippet = visible_atom
                 .get("snippet")
                 .and_then(|snippet| snippet.as_str())
                 .unwrap_or("");
-            if !snippet.is_empty() {
+            if citable && !snippet.is_empty() {
                 let number =
                     ctx.citations
                         .register(CitationSource::Atom, atom_id, None, excerpt(snippet));

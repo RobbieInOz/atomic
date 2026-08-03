@@ -129,6 +129,16 @@ pub struct RunOutcome {
     pub content: String,
     /// The full message history including every tool round — the input to a
     /// caller's final pass.
+    ///
+    /// **Balanced only when the run wasn't cancelled.** The loop checks its
+    /// cancel flag between tool executions, so a cancel landing partway
+    /// through a round leaves an assistant message requesting N tool calls
+    /// followed by fewer than N `tool` results. Providers reject that history:
+    /// every `tool_calls` entry must be answered. Callers that replay these
+    /// messages — a final synthesis pass, a resumed run — must therefore skip
+    /// [`StopReason::Cancelled`] outcomes, or balance the history themselves
+    /// with [`messages_are_balanced`]. Chat doesn't replay them at all, and
+    /// reports pass no cancel flag, which is why nothing does today.
     pub messages: Vec<Message>,
     /// Every tool call made, in order.
     pub tool_calls: Vec<ToolCallRecord>,
@@ -322,6 +332,10 @@ impl AgentRun<'_> {
             };
         }
 
+        debug_assert!(
+            stop == StopReason::Cancelled || messages_are_balanced(&messages),
+            "a run that wasn't cancelled must leave every requested tool call answered"
+        );
         Ok(RunOutcome {
             content,
             messages,
@@ -329,6 +343,21 @@ impl AgentRun<'_> {
             stop,
         })
     }
+}
+
+/// Whether every tool call requested in `messages` has a matching `tool`
+/// result — the precondition providers impose on a replayed history. See
+/// [`RunOutcome::messages`] for when it can fail to hold.
+pub fn messages_are_balanced(messages: &[Message]) -> bool {
+    let answered: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .all(|call| answered.contains(call.id.as_str()))
 }
 
 /// One tool-free completion to turn a run's gathered context into an answer.
@@ -461,5 +490,418 @@ impl Completer {
             }
         }
         .map_err(|e| RunError::Provider(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The loop's provider-facing contract, proven against **every** wire
+    //! dialect rather than only the OpenAI-compatible SSE shape the
+    //! integration suite drives.
+    //!
+    //! This matters because the three providers diverge exactly where this
+    //! module is most load-bearing. OpenRouter and OpenAI-compat stream SSE
+    //! frames and rebuild each tool call from string-valued `arguments`
+    //! deltas keyed by `index`; Ollama streams newline-delimited JSON, emits
+    //! each tool call whole with **object**-valued arguments, sends no id and
+    //! no index, and leaves the assembled response's `finish_reason` unset. A
+    //! loop that only ever saw the first shape could depend on any of those
+    //! accidents. Every test below therefore runs its assertions once per
+    //! dialect against a mock server that speaks all three.
+
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use atomic_test_support::{InjectedFailure, MockAiServer};
+    use serde_json::json;
+
+    use super::*;
+    use crate::agent_runtime::citations::CitationAdmission;
+    use crate::agent_runtime::AgentTool;
+    use crate::providers::types::ToolDefinition;
+    use crate::providers::ProviderType;
+
+    /// A tool that always succeeds, so a run can get past its first turn.
+    struct Echo;
+
+    #[async_trait]
+    impl AgentTool for Echo {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new(
+                "echo",
+                "Echo the note back",
+                json!({
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } },
+                    "required": ["note"],
+                    "additionalProperties": false,
+                }),
+            )
+        }
+
+        async fn execute(&self, args: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolResult {
+            ToolResult::ok(
+                format!("echo: {}", args["note"].as_str().unwrap_or("<missing>")),
+                1,
+            )
+        }
+    }
+
+    /// The three provider dialects, each pointed at the same mock server.
+    /// Iterated by every test so a divergence shows up as a named failure.
+    fn dialects(mock: &MockAiServer) -> Vec<(&'static str, ProviderConfig)> {
+        let base = ProviderConfig::from_settings(&std::collections::HashMap::new());
+
+        let mut openrouter = base.clone();
+        openrouter.provider_type = ProviderType::OpenRouter;
+        openrouter.openrouter_api_key = Some("mock-openrouter-key".to_string());
+        // Deliberately the bare mock URL: the provider's own normalization
+        // has to append `/v1` for this to reach the mock at all.
+        openrouter.openrouter_base_url = mock.base_url();
+
+        let mut compat = base.clone();
+        compat.provider_type = ProviderType::OpenAICompat;
+        compat.openai_compat_base_url = mock.base_url();
+        compat.openai_compat_api_key = Some("mock-compat-key".to_string());
+
+        let mut ollama = base;
+        ollama.provider_type = ProviderType::Ollama;
+        ollama.ollama_host = mock.base_url();
+
+        vec![
+            ("openrouter", openrouter),
+            ("openai_compat", compat),
+            ("ollama", ollama),
+        ]
+    }
+
+    /// Collect every [`RunEvent`] a run emits.
+    fn event_sink() -> (RunEventSink, Arc<Mutex<Vec<RunEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        (
+            Arc::new(move |event| sink.lock().expect("event sink").push(event)),
+            events,
+        )
+    }
+
+    fn deltas(events: &Arc<Mutex<Vec<RunEvent>>>) -> Vec<String> {
+        events
+            .lock()
+            .expect("event sink")
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::Delta { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A streaming chat-shaped run: the configuration `agent::chat` uses,
+    /// with the caps a test can afford.
+    fn chat_config(max_iterations: usize, salvage_on_cap: bool) -> RunConfig {
+        RunConfig {
+            model: "mock-model".to_string(),
+            params: GenerationParams::new()
+                .with_temperature(0.7)
+                .with_max_tokens(4000),
+            max_iterations,
+            termination: Termination::NoToolCalls,
+            streaming: true,
+            salvage_on_cap,
+            context_length: None,
+        }
+    }
+
+    /// Reset every knob and counter so each dialect's pass starts clean.
+    fn reset(mock: &MockAiServer) {
+        mock.reset_counts();
+        mock.set_chat_failure(None);
+        mock.set_chat_delay(None);
+        mock.set_chat_force_tool_calls(false);
+        mock.set_chat_tool_call(None);
+    }
+
+    /// Text streams back chunk by chunk on every dialect, and the chunks
+    /// concatenate to the answer rather than repeating it. NDJSON framing
+    /// has to yield the same per-fragment cadence as SSE.
+    #[tokio::test]
+    async fn streamed_text_arrives_one_event_per_chunk_on_every_dialect() {
+        let mock = MockAiServer::start().await;
+        for (dialect, provider_config) in dialects(&mock) {
+            reset(&mock);
+            let (sink, events) = event_sink();
+            let ledger = CitationLedger::new(CitationAdmission::Open);
+            let outcome = AgentRun {
+                config: chat_config(4, true),
+                provider_config: &provider_config,
+                tools: &ToolRegistry::new(),
+                citations: &ledger,
+                messages: vec![Message::user("what did I write about pelicans?")],
+                cancel: None,
+                events: Some(sink),
+            }
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{dialect}: run failed: {e}"));
+
+            assert_eq!(outcome.stop, StopReason::Answered, "{dialect}");
+            let deltas = deltas(&events);
+            assert!(
+                deltas.len() > 1,
+                "{dialect}: expected one event per provider chunk, got {deltas:?}"
+            );
+            assert_eq!(
+                deltas.concat(),
+                outcome.content,
+                "{dialect}: deltas must concatenate to the answer, not repeat it"
+            );
+        }
+    }
+
+    /// A tool call streamed by the provider reaches the loop intact — name
+    /// and arguments both — is dispatched, and its result carries the run
+    /// into a second turn that answers.
+    ///
+    /// This is the accumulation contract at its most dialect-sensitive:
+    /// OpenAI-shaped providers rebuild `arguments` from string deltas while
+    /// Ollama hands over a JSON object, and only one of those needs an id
+    /// from the wire. Either way the loop must see the same decoded input.
+    #[tokio::test]
+    async fn streamed_tool_calls_reach_the_loop_intact_on_every_dialect() {
+        let mock = MockAiServer::start().await;
+        for (dialect, provider_config) in dialects(&mock) {
+            reset(&mock);
+            mock.set_chat_tool_call(Some(("echo", json!({ "note": "pelicans" }))));
+
+            let (sink, events) = event_sink();
+            let ledger = CitationLedger::new(CitationAdmission::Open);
+            let outcome = AgentRun {
+                config: chat_config(4, true),
+                provider_config: &provider_config,
+                tools: &ToolRegistry::new().with(Echo),
+                citations: &ledger,
+                messages: vec![Message::user("echo something")],
+                cancel: None,
+                events: Some(sink),
+            }
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{dialect}: run failed: {e}"));
+
+            assert_eq!(outcome.stop, StopReason::Answered, "{dialect}");
+            assert_eq!(
+                outcome.tool_calls.len(),
+                1,
+                "{dialect}: exactly one tool round then an answer"
+            );
+            let call = &outcome.tool_calls[0];
+            assert_eq!(call.name, "echo", "{dialect}");
+            assert_eq!(
+                call.input,
+                json!({ "note": "pelicans" }),
+                "{dialect}: the arguments must survive the provider's encoding"
+            );
+            assert!(!call.failed, "{dialect}: {}", call.output);
+            assert_eq!(call.output, "echo: pelicans", "{dialect}");
+            assert!(
+                !call.id.is_empty(),
+                "{dialect}: every call needs an id, even where the wire sends none"
+            );
+
+            // The events a UI renders mirror the record.
+            let started: Vec<_> = events
+                .lock()
+                .expect("event sink")
+                .iter()
+                .filter_map(|event| match event {
+                    RunEvent::ToolStart {
+                        tool_name, input, ..
+                    } => Some((tool_name.clone(), input.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                started,
+                vec![("echo".to_string(), json!({ "note": "pelicans" }))],
+                "{dialect}"
+            );
+
+            // And the loop went on to answer from the tool result.
+            assert!(
+                outcome.content.contains("Mock assistant reply"),
+                "{dialect}: second turn should answer, got {:?}",
+                outcome.content
+            );
+        }
+    }
+
+    /// Out of tool-call budget with nothing said, the run spends one more
+    /// completion **with no tools offered** so it yields prose instead of
+    /// silence — on every dialect, since "offered no tools" is encoded
+    /// differently by each and the mock only answers in prose when it sees
+    /// none.
+    #[tokio::test]
+    async fn iteration_cap_salvages_with_a_tool_free_call_on_every_dialect() {
+        let mock = MockAiServer::start().await;
+        for (dialect, provider_config) in dialects(&mock) {
+            reset(&mock);
+            // A model that never stops researching.
+            mock.set_chat_force_tool_calls(true);
+            mock.set_chat_tool_call(Some(("echo", json!({ "note": "again" }))));
+
+            let ledger = CitationLedger::new(CitationAdmission::Open);
+            let outcome = AgentRun {
+                config: chat_config(2, true),
+                provider_config: &provider_config,
+                tools: &ToolRegistry::new().with(Echo),
+                citations: &ledger,
+                messages: vec![Message::user("keep digging")],
+                cancel: None,
+                events: None,
+            }
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{dialect}: run failed: {e}"));
+
+            assert_eq!(outcome.stop, StopReason::IterationCap, "{dialect}");
+            assert_eq!(
+                outcome.tool_calls.len(),
+                2,
+                "{dialect}: the budget is spent before salvage"
+            );
+            assert!(
+                outcome.content.contains("Mock assistant reply"),
+                "{dialect}: salvage must produce prose, got {:?}",
+                outcome.content
+            );
+
+            // The salvage call is the last one, and it offered no tools —
+            // that is what forces the model to answer instead of researching.
+            let bodies = mock.chat_request_bodies();
+            assert_eq!(
+                bodies.len(),
+                3,
+                "{dialect}: two capped turns plus one salvage"
+            );
+            let salvage = bodies.last().expect("salvage request");
+            assert!(
+                salvage
+                    .get("tools")
+                    .map(|tools| tools.as_array().is_some_and(|t| t.is_empty()))
+                    .unwrap_or(true),
+                "{dialect}: the salvage call must offer no tools: {salvage}"
+            );
+        }
+    }
+
+    /// Raising the cancel flag while a request is in flight drops that
+    /// request rather than waiting it out — the `tokio::select!` race, which
+    /// the integration suite's callback-driven cancellation never reaches
+    /// (it flips the flag between tool executions instead).
+    ///
+    /// Proven by latency: the provider is held for far longer than the run
+    /// is allowed to take.
+    #[tokio::test]
+    async fn cancelling_an_in_flight_request_stops_the_run_on_every_dialect() {
+        const PROVIDER_HOLD: Duration = Duration::from_secs(30);
+        // How long the run may take to notice, measured from the flag going
+        // up. Generous against a loaded box, still an order of magnitude
+        // under the hold — a run that waited the provider out would land at
+        // ~30s and fail loudly.
+        const CANCEL_BUDGET: Duration = Duration::from_secs(3);
+
+        let mock = MockAiServer::start().await;
+        for (dialect, provider_config) in dialects(&mock) {
+            reset(&mock);
+            mock.set_chat_delay(Some(PROVIDER_HOLD));
+
+            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+            let trigger = Arc::clone(&cancel);
+            // Stamped before the flag goes up, so a run that observes the
+            // flag always sees a stamp.
+            let raised_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+            let stamp = Arc::clone(&raised_at);
+            let raiser = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                *stamp.lock().expect("raise stamp") = Some(Instant::now());
+                trigger.store(true, Ordering::Relaxed);
+            });
+
+            let ledger = CitationLedger::new(CitationAdmission::Open);
+            let outcome = AgentRun {
+                config: chat_config(4, true),
+                provider_config: &provider_config,
+                tools: &ToolRegistry::new().with(Echo),
+                citations: &ledger,
+                messages: vec![Message::user("start something slow")],
+                cancel: Some(cancel),
+                events: None,
+            }
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{dialect}: a cancelled run still returns: {e}"));
+            let returned_at = Instant::now();
+            raiser.await.expect("flag raiser joined");
+
+            assert_eq!(outcome.stop, StopReason::Cancelled, "{dialect}");
+
+            // Latency is measured from the flag going up, not from the start
+            // of the run: the first HTTP client a process builds can stall
+            // the runtime for seconds loading the system trust store, which
+            // has nothing to do with how fast cancellation is noticed.
+            let raised_at = raised_at
+                .lock()
+                .expect("raise stamp")
+                .expect("the flag was raised before the run returned");
+            let latency = returned_at.duration_since(raised_at);
+            assert!(
+                latency < CANCEL_BUDGET,
+                "{dialect}: the run must abandon the in-flight request, not wait \
+                 it out — noticing took {latency:?}, and the provider was only \
+                 going to answer after {PROVIDER_HOLD:?}"
+            );
+            assert!(
+                outcome.tool_calls.is_empty(),
+                "{dialect}: nothing ran, so nothing is recorded"
+            );
+        }
+    }
+
+    /// A dead provider is a `RunError::Provider` carrying the provider's own
+    /// words — the variant chat turns into a `ChatEvent::Error`. Each dialect
+    /// has its own error-decoding path; all three must classify a 401 the
+    /// same way.
+    #[tokio::test]
+    async fn a_failing_provider_is_a_run_error_on_every_dialect() {
+        let mock = MockAiServer::start().await;
+        for (dialect, provider_config) in dialects(&mock) {
+            reset(&mock);
+            mock.set_chat_failure(Some(InjectedFailure::Unauthorized));
+
+            let ledger = CitationLedger::new(CitationAdmission::Open);
+            let error = AgentRun {
+                config: chat_config(4, true),
+                provider_config: &provider_config,
+                tools: &ToolRegistry::new().with(Echo),
+                citations: &ledger,
+                messages: vec![Message::user("anything")],
+                cancel: None,
+                events: None,
+            }
+            .execute()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{dialect}: a dead provider must fail the run"));
+
+            assert!(
+                matches!(error, RunError::Provider(_)),
+                "{dialect}: got {error:?}"
+            );
+            assert!(
+                error.to_string().contains("401"),
+                "{dialect}: the provider's status has to survive: {error}"
+            );
+        }
     }
 }

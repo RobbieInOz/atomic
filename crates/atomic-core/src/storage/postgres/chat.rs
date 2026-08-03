@@ -612,6 +612,26 @@ impl ChatStore for PostgresStorage {
         })
     }
 
+    async fn set_conversation_title_if_unset(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversations SET title = $1, updated_at = $2
+             WHERE id = $3 AND db_id = $4 AND title IS NULL",
+        )
+        .bind(title)
+        .bind(&now)
+        .bind(id)
+        .bind(&self.db_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete_conversation(&self, id: &str) -> StorageResult<()> {
         sqlx::query("DELETE FROM conversations WHERE id = $1 AND db_id = $2")
             .bind(id)
@@ -860,11 +880,10 @@ impl ChatStore for PostgresStorage {
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
+        // Names are a nicety; the scope itself is not. Tags that don't
+        // resolve still shape the paragraph, because retrieval applies the
+        // filter whether or not the prompt could name it.
         let names: HashMap<String, String> = rows.into_iter().collect();
-        if names.is_empty() {
-            Ok("You have access to a scoped set of atoms.".to_string())
-        } else {
-            Ok(crate::chat::describe_scope(scope, &names))
-        }
+        Ok(crate::chat::describe_scope(scope, &names))
     }
 }

@@ -598,6 +598,26 @@ pub fn update_conversation(
     .map_err(|_| AtomicCoreError::NotFound(format!("Conversation not found: {}", id)))
 }
 
+/// Name an untitled conversation, and say whether the name landed.
+///
+/// The auto-titler reads, decides, calls a model, and only then writes — long
+/// enough for the user to have typed their own title in between. `AND title
+/// IS NULL` makes the check and the write one statement, so a rename can
+/// never be overwritten by a generation that started before it. `false` means
+/// the conversation was already named and nothing changed.
+pub fn set_title_if_unset(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+) -> Result<bool, AtomicCoreError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title IS NULL",
+        rusqlite::params![title, &now, id],
+    )?;
+    Ok(updated > 0)
+}
+
 /// Delete a conversation
 pub fn delete_conversation(conn: &Connection, id: &str) -> Result<(), AtomicCoreError> {
     conn.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
@@ -817,8 +837,12 @@ pub fn get_conversation_scope(
 /// Describe a scope for the system prompt, given resolved tag names.
 ///
 /// Shared by both backends so the model is told the same contract the
-/// retrieval layer enforces. Tags whose names don't resolve are dropped —
-/// naming an id back to the model teaches it nothing.
+/// retrieval layer enforces. Tags whose names don't resolve are dropped from
+/// the lists — naming an id back to the model teaches it nothing — but every
+/// branch here keys off the *filter*, never off the names that survived
+/// resolution. A scope whose tags all failed to resolve is still a scope, and
+/// telling the model it has "ALL atoms" when retrieval will hand it a subset
+/// is the one lie this paragraph must not tell.
 pub(crate) fn describe_scope(
     scope: &ScopeFilter,
     names: &std::collections::HashMap<String, String>,
@@ -834,32 +858,44 @@ pub(crate) fn describe_scope(
         named(&scope.exclude),
     );
 
-    if include.is_empty() && require.is_empty() && exclude.is_empty() {
+    if scope.is_empty() {
         return "You have access to ALL atoms in the knowledge base.".to_string();
     }
 
     let mut sentences = Vec::new();
-    if include.is_empty() {
+    if scope.include.is_empty() {
         sentences.push("You have access to all atoms in the knowledge base, with the filters below applied to every search.".to_string());
+    } else if include.is_empty() {
+        sentences.push("You have access to a narrowed set of atoms: only those under the tags the user put in scope.".to_string());
     } else {
         sentences.push(format!(
             "You have access to atoms tagged with any of: {}. Focus your search on these topics.",
             include.join(", ")
         ));
     }
-    if !require.is_empty() {
-        sentences.push(format!(
-            "Only atoms tagged with every one of: {} are in scope.",
-            require.join(", ")
-        ));
+    if !scope.require.is_empty() {
+        sentences.push(if require.is_empty() {
+            "Some atoms are further required to carry every tag the user marked as required."
+                .to_string()
+        } else {
+            format!(
+                "Only atoms tagged with every one of: {} are in scope.",
+                require.join(", ")
+            )
+        });
     }
-    if !exclude.is_empty() {
-        sentences.push(format!(
-            "Atoms tagged with any of: {} are excluded and will never appear in your search results.",
-            exclude.join(", ")
-        ));
+    if !scope.exclude.is_empty() {
+        sentences.push(if exclude.is_empty() {
+            "Atoms under the tags the user excluded will never appear in your search results."
+                .to_string()
+        } else {
+            format!(
+                "Atoms tagged with any of: {} are excluded and will never appear in your search results.",
+                exclude.join(", ")
+            )
+        });
     }
-    sentences.push("A tag also covers its child tags. This scope is enforced by search itself — you cannot widen it.".to_string());
+    sentences.push("A tag also covers its child tags. Every tool enforces this scope — search, tag listings, articles, findings and reads by id alike — so you cannot widen it, and asking for something outside it will be refused rather than answered.".to_string());
     sentences.join(" ")
 }
 
@@ -876,23 +912,21 @@ pub fn get_scope_description(conn: &Connection, scope: &ScopeFilter) -> String {
         placeholders.join(", ")
     );
 
-    let mut stmt = match conn.prepare(&query) {
-        Ok(s) => s,
-        Err(_) => return "You have access to a scoped set of atoms.".to_string(),
+    // Names are a nicety; the scope itself is not. A lookup that fails still
+    // describes the shape of the filter, because retrieval will apply it
+    // whether or not the prompt could name it.
+    let names: std::collections::HashMap<String, String> = match conn.prepare(&query) {
+        Ok(mut stmt) => {
+            let params: Vec<&dyn rusqlite::ToSql> =
+                roots.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            stmt.query_map(params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+        Err(_) => std::collections::HashMap::new(),
     };
 
-    let params: Vec<&dyn rusqlite::ToSql> =
-        roots.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-    let names: std::collections::HashMap<String, String> = stmt
-        .query_map(params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    if names.is_empty() {
-        "You have access to a scoped set of atoms.".to_string()
-    } else {
-        describe_scope(scope, &names)
-    }
+    describe_scope(scope, &names)
 }
 
 /// Get conversation messages in provider Message format
@@ -1029,6 +1063,53 @@ mod tests {
         let updated =
             update_conversation(&conn, &conv.conversation.id, Some("Updated"), None).unwrap();
         assert_eq!(updated.title, Some("Updated".to_string()));
+    }
+
+    /// The auto-titler's write path. Its pre-flight check happens before a
+    /// model call that can take seconds, so the only thing standing between a
+    /// user's rename and a generated title clobbering it is this statement
+    /// re-checking as it writes.
+    #[test]
+    fn a_generated_title_only_lands_while_the_conversation_is_unnamed() {
+        let (db, _temp) = setup_db();
+        let conn = db.conn.lock().unwrap();
+
+        let untitled = create_conversation(&conn, &[], None).unwrap();
+        assert!(
+            set_title_if_unset(&conn, &untitled.conversation.id, "Generated").unwrap(),
+            "an untitled conversation takes the generated name"
+        );
+        assert_eq!(
+            get_conversation(&conn, &untitled.conversation.id)
+                .unwrap()
+                .unwrap()
+                .conversation
+                .title
+                .as_deref(),
+            Some("Generated")
+        );
+
+        // The rename the user typed while the model was thinking.
+        update_conversation(&conn, &untitled.conversation.id, Some("Renamed"), None).unwrap();
+        assert!(
+            !set_title_if_unset(&conn, &untitled.conversation.id, "Generated Again").unwrap(),
+            "a named conversation refuses the write, and reports that it did"
+        );
+        assert_eq!(
+            get_conversation(&conn, &untitled.conversation.id)
+                .unwrap()
+                .unwrap()
+                .conversation
+                .title
+                .as_deref(),
+            Some("Renamed"),
+            "the user's name is the one that stands"
+        );
+
+        assert!(
+            !set_title_if_unset(&conn, "no-such-conversation", "Generated").unwrap(),
+            "and a conversation that no longer exists is not an error, just a no-op"
+        );
     }
 
     #[test]

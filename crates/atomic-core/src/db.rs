@@ -1101,13 +1101,24 @@ impl Database {
         // meaningful per row.
         //
         // The table is rebuilt rather than altered because `atom_id`'s
-        // `REFERENCES atoms(id)` is now wrong: a wiki citation's id is a
-        // tag's, and this connection *does* enforce foreign keys. Losing
-        // the constraint also loses its ON DELETE CASCADE, so deleting an
-        // atom now leaves its citations behind as dead links — which is
-        // already how the Postgres backend behaves (its column never had
-        // the constraint) and how the readers already render a source that
-        // has gone missing.
+        // `REFERENCES atoms(id)` is now wrong and *is enforced*: a wiki
+        // citation's id belongs to a tag, so inserting one raises "FOREIGN
+        // KEY constraint failed". Note this holds despite no `PRAGMA
+        // foreign_keys = ON` appearing anywhere in the codebase — rusqlite's
+        // `bundled` feature compiles SQLite with
+        // `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, which flips the default for
+        // every connection we open. Losing the constraint also loses its ON
+        // DELETE CASCADE, so deleting an atom now leaves its citations behind
+        // as dead links — which is already how the Postgres backend behaves
+        // (its column never had the constraint) and how the readers already
+        // render a source that has gone missing.
+        //
+        // The rebuild runs in one transaction, version bump included: a crash
+        // partway through rolls back to v22 in full, and the next open retries
+        // from a consistent schema. Committing the DDL and the `user_version`
+        // separately is what would brick the database — a process killed
+        // between them leaves a v22 marker over a v23 schema, or a dropped
+        // table and no replacement.
         if version < 23 {
             let has_col: bool = conn
                 .query_row(
@@ -1117,8 +1128,9 @@ impl Database {
                 )
                 .unwrap_or(false);
 
+            let tx = conn.unchecked_transaction()?;
             if !has_col {
-                conn.execute_batch(
+                tx.execute_batch(
                     "CREATE TABLE chat_citations_v23 (
                          id TEXT PRIMARY KEY,
                          message_id TEXT NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
@@ -1139,8 +1151,8 @@ impl Database {
                      CREATE INDEX IF NOT EXISTS idx_chat_citations_atom ON chat_citations(atom_id);",
                 )?;
             }
-
-            conn.execute_batch("PRAGMA user_version = 23;")?;
+            tx.execute_batch("PRAGMA user_version = 23;")?;
+            tx.commit()?;
         }
 
         // V24: a conversation's scope tags carry the role they play —
@@ -1565,6 +1577,61 @@ mod tests {
                 .unwrap_or(false);
             assert!(exists, "Table '{}' should exist", table);
         }
+    }
+
+    /// Foreign keys are on — our bundled SQLite is compiled with
+    /// `SQLITE_DEFAULT_FOREIGN_KEYS=1` — which is the whole reason V23
+    /// rebuilds `chat_citations` instead of adding a column to it. If this
+    /// ever reads OFF, the rebuild's justification is gone; if `atom_id`
+    /// regains its `REFERENCES atoms(id)`, wiki citations (whose id is a
+    /// *tag's*) stop being insertable.
+    #[test]
+    fn chat_citations_can_hold_ids_that_are_not_atoms() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Database::open_or_create(temp_file.path()).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let foreign_keys: i32 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            foreign_keys, 1,
+            "foreign keys are enforced on our connections; V23's rebuild depends on it"
+        );
+
+        let references_atoms: bool = conn
+            .prepare("SELECT 1 FROM pragma_foreign_key_list('chat_citations') WHERE \"table\" = 'atoms'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(
+            !references_atoms,
+            "chat_citations.atom_id must not reference atoms — a wiki citation stores a tag id"
+        );
+    }
+
+    /// The V23 rebuild is one transaction, so a database interrupted anywhere
+    /// inside it comes back as a coherent v22 and re-migrates. This pins the
+    /// invariant the transaction exists to protect: version and schema never
+    /// disagree.
+    #[test]
+    fn migrating_twice_is_a_no_op() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Database::open_or_create(temp_file.path()).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        Database::run_migrations(&conn).unwrap();
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, Database::LATEST_VERSION);
+        let has_source_type: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('chat_citations') WHERE name = 'source_type'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_source_type, "source_type survives a re-run");
     }
 
     #[test]

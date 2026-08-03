@@ -370,10 +370,22 @@ mod tests {
             (&Method::DELETE, "/api/atoms/abc-123"),
             (&Method::PUT, "/api/settings/onboarding_completed"),
             (&Method::POST, "/api/tags"),
-            // Chat / conversations — closed by decision.
+            // Chat / conversations — closed by decision. The whole surface,
+            // not just the collection: an anonymous visitor must not be able
+            // to spend a turn, stop someone else's, or reshape a scope, and
+            // the whitelist is what closes routes the chat era added after
+            // this table was written.
             (&Method::GET, "/api/conversations"),
             (&Method::POST, "/api/conversations"),
             (&Method::GET, "/api/conversations/c-1"),
+            (&Method::PUT, "/api/conversations/c-1"),
+            (&Method::DELETE, "/api/conversations/c-1"),
+            (&Method::GET, "/api/conversations/c-1/messages"),
+            (&Method::POST, "/api/conversations/c-1/messages"),
+            (&Method::POST, "/api/conversations/c-1/messages/cancel"),
+            (&Method::PUT, "/api/conversations/c-1/scope"),
+            (&Method::POST, "/api/conversations/c-1/scope/tags"),
+            (&Method::DELETE, "/api/conversations/c-1/scope/tags/t-1"),
             // Exports — the billing guard's egress exemption must NOT
             // carry over to anonymous visitors.
             (&Method::POST, "/api/databases/default/exports/markdown"),

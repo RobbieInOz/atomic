@@ -11,7 +11,9 @@
 //!   slow or dead title model costs the message flow nothing. Every failure
 //!   is a log line; the title simply stays `NULL` and the next turn retries.
 //! - **It never overwrites a title.** A non-`NULL` title — auto-generated
-//!   earlier or typed by the user — ends generation before the model call.
+//!   earlier or typed by the user — ends generation before the model call,
+//!   and the write itself is conditional on the title still being `NULL`, so
+//!   a rename that lands while the model is thinking wins.
 //! - **It rides the tagging model**, not the chat model: naming a
 //!   conversation is a cheap utility completion, the same class of work as
 //!   auto-tagging, and shouldn't bill at agentic-model rates.
@@ -67,14 +69,22 @@ pub(crate) fn spawn_generation(
             }
         };
 
+        // The pre-flight check in `generate` happens before a model call that
+        // can take seconds; the user can name the conversation inside that
+        // window. This write re-checks and skips atomically, so the rename
+        // survives — and with no row written there is nothing to announce.
         match storage
-            .update_conversation_sync(&conversation_id, Some(&title), None)
+            .set_conversation_title_if_unset_sync(&conversation_id, &title)
             .await
         {
-            Ok(_) => on_event(ChatEvent::ConversationUpdated {
+            Ok(true) => on_event(ChatEvent::ConversationUpdated {
                 conversation_id,
                 title,
             }),
+            Ok(false) => tracing::debug!(
+                conversation_id = %conversation_id,
+                "chat: conversation was named while its title was generating; keeping the existing title"
+            ),
             Err(error) => tracing::warn!(
                 conversation_id = %conversation_id,
                 error = %error,

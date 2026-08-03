@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { MessageSquare } from 'lucide-react';
-import { useChatStore } from '../../stores/chat';
+import { useChatStore, scopeModeOf } from '../../stores/chat';
 import { useUIStore } from '../../stores/ui';
-import { useChatEvents } from '../../hooks/useChatEvents';
 import { useContentSearch } from '../../hooks';
 import { ChatHeader } from './ChatHeader';
 import { ChatMessage } from './ChatMessage';
@@ -14,6 +13,7 @@ export function ChatView() {
   const currentConversation = useChatStore(s => s.currentConversation);
   const messages = useChatStore(s => s.messages);
   const isLoading = useChatStore(s => s.isLoading);
+  const streamingConversationId = useChatStore(s => s.streamingConversationId);
   const isStreaming = useChatStore(s => s.isStreaming);
   const isCancelling = useChatStore(s => s.isCancelling);
   const streamingContent = useChatStore(s => s.streamingContent);
@@ -22,6 +22,13 @@ export function ChatView() {
   const sendMessage = useChatStore(s => s.sendMessage);
   const cancelResponse = useChatStore(s => s.cancelResponse);
   const goBack = useChatStore(s => s.goBack);
+
+  // The streaming fields describe one conversation's turn. Rendering them here
+  // is only correct when that conversation is the one on screen — otherwise a
+  // turn left running elsewhere would show up as this conversation thinking.
+  const isStreamingHere =
+    isStreaming && streamingConversationId !== null &&
+    streamingConversationId === currentConversation?.id;
 
   const openReader = useUIStore(s => s.openReader);
 
@@ -62,9 +69,6 @@ export function ChatView() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [openSearch]);
 
-  // Subscribe to chat events for streaming
-  useChatEvents(currentConversation?.id ?? null);
-
   // Check if user is near the bottom of the scroll container
   const checkIfNearBottom = useCallback(() => {
     const container = messagesContainerRef.current;
@@ -94,7 +98,7 @@ export function ChatView() {
   }, []);
 
   const handleSend = async () => {
-    if (!inputValue.trim() || isStreaming) return;
+    if (!inputValue.trim() || isStreamingHere) return;
 
     const content = inputValue.trim();
     setInputValue('');
@@ -123,7 +127,7 @@ export function ChatView() {
   }
 
   const scopeSubjects = currentConversation.tags
-    .filter((t) => t.mode !== 'exclude')
+    .filter((t) => scopeModeOf(t) !== 'exclude')
     .map((t) => t.name);
 
   return (
@@ -151,7 +155,7 @@ export function ChatView() {
             onClose={closeSearch}
           />
         )}
-        {messages.length === 0 && !isStreaming && (
+        {messages.length === 0 && !isStreamingHere && (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
             <div className="w-16 h-16 rounded-full bg-[var(--color-bg-card)] flex items-center justify-center">
               <MessageSquare className="w-8 h-8 text-[var(--color-accent)]" strokeWidth={2} />
@@ -179,7 +183,7 @@ export function ChatView() {
             calls show up while the model is still thinking and persist as
             streaming content flows in. ChatMessage handles the empty-content
             "Thinking…" fallback. */}
-        {isStreaming && (
+        {isStreamingHere && (
           <ChatMessage
             message={{
               id: 'streaming',
@@ -217,9 +221,9 @@ export function ChatView() {
         onChange={setInputValue}
         onSend={handleSend}
         onKeyDown={handleKeyDown}
-        disabled={isStreaming}
-        isStreaming={isStreaming}
-        isCancelling={isCancelling}
+        disabled={isStreamingHere}
+        isStreaming={isStreamingHere}
+        isCancelling={isStreamingHere && isCancelling}
         onStop={cancelResponse}
         placeholder={
           // Excluded tags say what the conversation isn't about — naming them

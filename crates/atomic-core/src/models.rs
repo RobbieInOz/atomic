@@ -915,12 +915,13 @@ pub struct ChatToolCall {
 /// `source_type` names: `atom` (the default, and what every row written
 /// before source types existed is), `wiki`, or `finding`. `atom_id` is the
 /// id of that source — an atom id, the *tag* id of a wiki article, or the
-/// finding atom's id — so exactly one id column is ever meaningful. (Neither
-/// backend constrains that column any more: a wiki citation's id belongs to
-/// a tag, so SQLite's `REFERENCES atoms(id)` was dropped in the v23 table
-/// rebuild. Deleting a source consequently leaves its citations behind as
-/// dead links, which is how the readers already render a source that has
-/// gone missing.)
+/// finding atom's id — so exactly one id column is ever meaningful. Neither
+/// backend constrains that column any more: Postgres never declared a foreign
+/// key on it, and SQLite's `REFERENCES atoms(id)` — which *was* enforced, our
+/// bundled SQLite defaulting `foreign_keys` on — was dropped in the v23 table
+/// rebuild, because a wiki citation's id belongs to a tag. Deleting a source
+/// consequently leaves its citations behind as dead links, which is how the
+/// readers already render a source that has gone missing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ChatCitation {

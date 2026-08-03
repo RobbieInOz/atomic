@@ -114,9 +114,15 @@ impl ChatCancellations {
         let flag = atomic_core::ChatCancel::default();
         if let Ok(mut turns) = self.turns.lock() {
             // A second turn on the same conversation (double-send, or a retry
-            // racing its predecessor) supersedes the first; the older guard's
-            // pointer check keeps it from removing this entry on drop.
-            turns.insert(key.clone(), Arc::clone(&flag));
+            // racing its predecessor) supersedes the first. Superseding means
+            // stopping it: the displaced turn is now unreachable — no cancel
+            // can find its flag once this one takes the key — so raise it here
+            // or it streams to completion into a conversation whose next
+            // answer is already being written. The older guard's pointer check
+            // keeps it from removing this entry when it finally drops.
+            if let Some(displaced) = turns.insert(key.clone(), Arc::clone(&flag)) {
+                displaced.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         ChatTurn {
             registry: self,

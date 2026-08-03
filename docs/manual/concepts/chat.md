@@ -33,6 +33,8 @@ Every turn has the same core tools — your atoms, the synthesized layers above 
 
 More tools appear conditionally: `get_current_page_context` when the app sent page context (see below), and `zoom_to_cluster` / `focus_atom` when you are chatting over the canvas.
 
+Every reading tool answers within the conversation's scope — see [Scoped Conversations](#scoped-conversations).
+
 ## Citations
 
 The Sources list under an answer holds only the sources the answer actually cited. Every tool result the agent sees is numbered, and the `[N]` markers in the finished text decide which of those numbered sources are stored — material the agent read but never cited leaves no trace, and a number the model invents is dropped. A source surfaced more than once in a turn keeps its first number, so `[2]` means the same thing everywhere in an answer.
@@ -57,7 +59,9 @@ Conversations can be scoped to specific tags, giving you focused answers about a
 
 An atom is in scope when it satisfies all three rules at once. With nothing included, the base set is your whole knowledge base and the remaining rules narrow it — so an exclude-only scope means "everything except this". A tag always covers its child tags.
 
-The scope is enforced by search itself, not by asking the model to behave: the assistant is told what the scope is, and cannot widen it. Reading a specific atom, wiki article, or report finding by id is deliberately unscoped — the scope shapes what the agent can *find*, not what you can point it at.
+The scope is enforced by the tools, not by asking the model to behave: the assistant is told what the scope is, and cannot widen it. Every read goes through the same rule — search results, the tag tree `list_tags` returns, the article `get_wiki` reads, the findings `list_reports` names and `get_finding` opens, and any atom fetched by id. A request for something outside the scope comes back as a refusal that says so, with none of the content attached.
+
+The one deliberate exception is the page context you share with a message: what you are currently looking at reaches the assistant because you chose to share it (see [Page Context](#page-context)). It is never turned into a citation when the scope excludes it, so an answer can't come to rest on it.
 
 ## Conversations
 

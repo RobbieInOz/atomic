@@ -23,7 +23,7 @@ pub mod tools;
 pub use citations::{Citable, CitationAdmission, CitationLedger, CitationSource};
 pub use context::truncate_messages_to_context;
 pub use run::{
-    AgentRun, CancelFlag, RunConfig, RunError, RunEvent, RunEventSink, RunOutcome, StopReason,
-    Termination, ToolCallRecord,
+    messages_are_balanced, AgentRun, CancelFlag, RunConfig, RunError, RunEvent, RunEventSink,
+    RunOutcome, StopReason, Termination, ToolCallRecord,
 };
 pub use tools::{AgentTool, ToolContext, ToolRegistry, ToolResult};

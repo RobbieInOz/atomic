@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
 import { X, Plus } from 'lucide-react';
-import { ConversationWithTags, ScopeMode, useChatStore } from '../../stores/chat';
+import { ConversationWithTags, ScopeMode, scopeModeOf, useChatStore } from '../../stores/chat';
 import { useTagsStore } from '../../stores/tags';
 
 interface ScopeEditorProps {
@@ -209,12 +209,13 @@ export function ScopeEditor({ conversation }: ScopeEditorProps) {
 
       {/* Without an included tag the base set is everything, and the
           remaining chips narrow it — say so instead of leaving it implied. */}
-      {!conversation.tags.some((tag) => tag.mode === 'include') && (
+      {!conversation.tags.some((tag) => scopeModeOf(tag) === 'include') && (
         <span className="text-sm text-[var(--color-text-secondary)] italic">All atoms</span>
       )}
 
       {conversation.tags.map((tag) => {
-        const style = MODE_STYLE[tag.mode] ?? MODE_STYLE.include;
+        const mode = scopeModeOf(tag);
+        const style = MODE_STYLE[mode];
         return (
           <span
             key={tag.id}
@@ -224,10 +225,10 @@ export function ScopeEditor({ conversation }: ScopeEditorProps) {
               <span className="text-[9px] uppercase tracking-wide opacity-70">{style.label}</span>
             )}
             <button
-              onClick={() => handleCycleMode(tag.id, tag.mode)}
+              onClick={() => handleCycleMode(tag.id, mode)}
               title={style.hint}
               className={style.name}
-              aria-label={`${tag.name}: ${tag.mode}. Change how this tag scopes the conversation`}
+              aria-label={`${tag.name}: ${mode}. Change how this tag scopes the conversation`}
             >
               {tag.name}
             </button>

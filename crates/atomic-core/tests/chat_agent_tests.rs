@@ -18,7 +18,7 @@ use atomic_core::{
     ScopeMode,
 };
 use serde_json::json;
-use support::{await_pipeline, event_collector, setup_core, Backend, MockAiServer};
+use support::{await_pipeline, event_collector, open_bare, setup_core, Backend, MockAiServer};
 
 /// Collect every `ChatEvent` the turn emits, and optionally react to one.
 fn chat_event_collector(
@@ -934,5 +934,477 @@ async fn require_and_exclude_shape_what_search_returns() {
             && system_prompt.contains("every one of: Sailing")
             && system_prompt.contains("Draft"),
         "the scope paragraph names all three lists: {system_prompt}"
+    );
+}
+
+// ==================== Scope binds every reading tool ====================
+//
+// Search enforces the scope inside its query, so nothing outside can come
+// back. Every other reading tool takes an *id* and would otherwise fetch it
+// unconditionally — which would make the system prompt's "will never appear …
+// you cannot widen it" a suggestion the model can decline. These pin the
+// refusals, one tool at a time, and then the whole chain end to end.
+
+/// A knowledge base with a public tag and a private one, the private tag's
+/// atom carrying a wiki article, and a conversation that excludes it.
+struct ExcludedFixture {
+    handle: support::CoreHandle,
+    private_tag: atomic_core::Tag,
+    private_atom: String,
+    public_atom: String,
+    conversation_id: String,
+}
+
+async fn excluded_fixture(core_url: &str) -> ExcludedFixture {
+    let handle = setup_core(Backend::Sqlite, core_url)
+        .await
+        .expect("sqlite core");
+    let core = &handle.core;
+
+    let public = core.create_tag("Pelicans", None).await.expect("public tag");
+    let private = core.create_tag("Therapy", None).await.expect("private tag");
+    let public_atom = seed_atom(core, "pelicans dive for fish", &[public.id.as_str()]).await;
+    let private_atom = seed_atom(
+        core,
+        "pelicans came up in a private session",
+        &[private.id.as_str()],
+    )
+    .await;
+    core.generate_wiki(&private.id, &private.name)
+        .await
+        .expect("generate the excluded tag's article");
+
+    let conversation_id = core
+        .create_conversation(&[], Some("scoped"))
+        .await
+        .expect("create conversation")
+        .conversation
+        .id;
+    core.add_tag_to_scope(&conversation_id, &private.id, ScopeMode::Exclude)
+        .await
+        .expect("exclude the private tag");
+
+    ExcludedFixture {
+        handle,
+        private_tag: private,
+        private_atom,
+        public_atom,
+        conversation_id,
+    }
+}
+
+/// Run one turn that calls `tool` with `args`, and return what the tool told
+/// the model.
+async fn tool_call_output(
+    core: &AtomicCore,
+    mock: &MockAiServer,
+    conversation_id: &str,
+    tool: &str,
+    args: serde_json::Value,
+) -> ChatMessageWithContext {
+    mock.set_chat_tool_call(Some((tool, args)));
+    let (callback, _events) = chat_event_collector(|_| {});
+    core.send_chat_message(conversation_id, "tell me about it", callback, None)
+        .await
+        .expect("chat turn")
+}
+
+/// The end-to-end bypass the four read tools opened: name an excluded tag in
+/// the prompt, read its article, walk its atoms. Every door is shut, and none
+/// of them leaks the content while shutting.
+#[tokio::test]
+async fn an_excluded_tag_cannot_be_read_through_any_tool() {
+    let mock = MockAiServer::start().await;
+    let fixture = excluded_fixture(&mock.base_url()).await;
+    let core = &fixture.handle.core;
+    let conversation_id = fixture.conversation_id.as_str();
+
+    // 1. The article. The densest read in the knowledge base, and the one the
+    //    exclude mode was most obviously bypassed by.
+    let wiki = tool_call_output(
+        core,
+        &mock,
+        conversation_id,
+        "get_wiki",
+        json!({ "tag": fixture.private_tag.name }),
+    )
+    .await;
+    let output = tool_output(&wiki);
+    assert!(
+        output.contains("outside this conversation's scope"),
+        "the article is refused, and the refusal says why: {output}"
+    );
+    assert!(
+        !output.contains("mock article body"),
+        "no part of the article reaches the model: {output}"
+    );
+    assert!(
+        wiki.citations.is_empty(),
+        "a refused read is not evidence: {:?}",
+        wiki.citations
+    );
+
+    // 2. The atom behind it, by id — the fallback once the article is shut.
+    let atom = tool_call_output(
+        core,
+        &mock,
+        conversation_id,
+        "get_atom",
+        json!({ "atom_id": fixture.private_atom }),
+    )
+    .await;
+    let output = tool_output(&atom);
+    assert!(
+        output.contains("outside this conversation's scope"),
+        "reading the excluded atom by id is refused: {output}"
+    );
+    assert!(
+        !output.contains("private session"),
+        "no content leaks with the refusal: {output}"
+    );
+    assert!(atom.citations.is_empty(), "and nothing became citable");
+
+    // 3. The tag tree, which is how the model would find either of them.
+    let tags = tool_call_output(core, &mock, conversation_id, "list_tags", json!({})).await;
+    let output = tool_output(&tags);
+    assert!(
+        !output.contains(&fixture.private_tag.name) && !output.contains(&fixture.private_tag.id),
+        "the excluded branch is not on the map: {output}"
+    );
+    assert!(
+        output.contains("Pelicans"),
+        "the rest of the tree still is: {output}"
+    );
+
+    // 4. Expanding the excluded branch by id, in case the model already knows it.
+    let expanded = tool_call_output(
+        core,
+        &mock,
+        conversation_id,
+        "list_tags",
+        json!({ "parent_id": fixture.private_tag.id }),
+    )
+    .await;
+    assert!(
+        tool_output(&expanded).contains("outside this conversation's scope"),
+        "an excluded branch cannot be expanded: {}",
+        tool_output(&expanded)
+    );
+
+    // And the atom that *is* in scope still reads normally — the scope closed
+    // a door, it didn't brick the tools.
+    let allowed = tool_call_output(
+        core,
+        &mock,
+        conversation_id,
+        "get_atom",
+        json!({ "atom_id": fixture.public_atom }),
+    )
+    .await;
+    assert!(
+        tool_output(&allowed).contains("dive for fish"),
+        "in-scope atoms read as before: {}",
+        tool_output(&allowed)
+    );
+    assert_eq!(
+        allowed.citations.len(),
+        1,
+        "and are citable: {:?}",
+        allowed.citations
+    );
+}
+
+/// An include scope is the other half: the listing narrows to what was
+/// included (plus the ancestors it hangs from), and an article outside it is
+/// refused even though nothing was explicitly excluded.
+#[tokio::test]
+async fn an_include_scope_hides_the_rest_of_the_tree() {
+    let mock = MockAiServer::start().await;
+    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+        .await
+        .expect("sqlite core");
+    let core = handle.core;
+
+    let birds = core.create_tag("Birds", None).await.expect("Birds");
+    let pelicans = core
+        .create_tag("Pelicans", Some(&birds.id))
+        .await
+        .expect("Pelicans");
+    let finance = core.create_tag("Finance", None).await.expect("Finance");
+    seed_atom(&core, "pelicans dive for fish", &[pelicans.id.as_str()]).await;
+    seed_atom(&core, "pelicans of the balance sheet", &[finance.id.as_str()]).await;
+    core.generate_wiki(&finance.id, &finance.name)
+        .await
+        .expect("generate the out-of-scope article");
+
+    let conversation_id = core
+        .create_conversation(&[pelicans.id.clone()], Some("included"))
+        .await
+        .expect("create conversation")
+        .conversation
+        .id;
+
+    let tags = tool_call_output(&core, &mock, &conversation_id, "list_tags", json!({})).await;
+    let output = tool_output(&tags);
+    assert!(
+        output.contains("Pelicans") && output.contains("Birds"),
+        "the included branch shows, with the ancestor it hangs from: {output}"
+    );
+    assert!(
+        !output.contains("Finance"),
+        "nothing outside the include scope does: {output}"
+    );
+
+    let wiki = tool_call_output(
+        &core,
+        &mock,
+        &conversation_id,
+        "get_wiki",
+        json!({ "tag": "Finance" }),
+    )
+    .await;
+    assert!(
+        tool_output(&wiki).contains("outside this conversation's scope"),
+        "an article outside the include scope is refused: {}",
+        tool_output(&wiki)
+    );
+}
+
+/// Reports are configuration; their findings are content. A report whose
+/// finding the conversation can't read stays on the menu — with nothing on it
+/// that would let the model order the dish.
+#[tokio::test]
+async fn list_reports_withholds_a_finding_the_scope_excludes() {
+    let mock = MockAiServer::start().await;
+    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+        .await
+        .expect("sqlite core");
+    let core = handle.core;
+
+    let tag = core.create_tag("Therapy", None).await.expect("create tag");
+    seed_atom(&core, "pelicans came up in session", &[tag.id.as_str()]).await;
+    let report = core
+        .create_report(CreateReportRequest {
+            name: "Session Notes".to_string(),
+            research_prompt: "Summarize the sessions.".to_string(),
+            source_scope_tag_ids: vec![tag.id.clone()],
+            schedule: "0 0 * * * *".to_string(),
+            // The finding lands under the excluded tag, which is what puts it
+            // outside this conversation.
+            output_atom_tags: vec![tag.id.clone()],
+            ..Default::default()
+        })
+        .await
+        .expect("create report");
+    let finding_atom_id = match core.run_report_now(&report.id).await.expect("run report") {
+        RunOutcome::Succeeded { finding_atom_id } => finding_atom_id,
+        other => panic!("expected a finding, got {other:?}"),
+    };
+
+    let conversation_id = core
+        .create_conversation(&[], Some("scoped"))
+        .await
+        .expect("create conversation")
+        .conversation
+        .id;
+    core.add_tag_to_scope(&conversation_id, &tag.id, ScopeMode::Exclude)
+        .await
+        .expect("exclude the tag");
+
+    let listing = tool_call_output(&core, &mock, &conversation_id, "list_reports", json!({})).await;
+    let output = tool_output(&listing);
+    assert!(
+        output.contains("Session Notes (report_id:"),
+        "the report itself is still listed: {output}"
+    );
+    assert!(
+        output.contains("latest finding: outside this conversation's scope"),
+        "but its finding is withheld, and says so: {output}"
+    );
+    assert!(
+        !output.contains(&finding_atom_id),
+        "the finding's id is not handed over either: {output}"
+    );
+
+    let read = tool_call_output(
+        &core,
+        &mock,
+        &conversation_id,
+        "get_finding",
+        json!({ "atom_id": finding_atom_id }),
+    )
+    .await;
+    let output = tool_output(&read);
+    assert!(
+        output.contains("outside this conversation's scope"),
+        "and reading it by id is refused: {output}"
+    );
+    assert!(
+        !output.contains("Mock Finding"),
+        "with none of its body: {output}"
+    );
+    assert!(read.citations.is_empty(), "and nothing became citable");
+}
+
+// ==================== Which model each leg rides ====================
+//
+// A chat turn spends on two different models: the agentic one that runs the
+// loop, and — after the turn — the cheap utility one that names the
+// conversation (`chat_title`: "naming a conversation is a cheap utility
+// completion ... and shouldn't bill at agentic-model rates"). Only
+// OpenRouter *has* two models to choose between; Ollama and OpenAI-compat
+// expose a single LLM that both legs must land on. The resolution therefore
+// reads differently per provider and is worth pinning per provider — a
+// regression here is invisible in behavior and visible only on the bill.
+
+/// The `model` on the conversation-title completion. The title leg is a
+/// plain, tool-free completion whose system prompt asks for "a conversation
+/// title"; that phrase is how the mock recognizes it too.
+fn title_request_model(mock: &MockAiServer) -> Option<String> {
+    mock.chat_request_bodies()
+        .into_iter()
+        .find(|body| {
+            body["messages"]
+                .as_array()
+                .is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("conversation title"))
+                    })
+                })
+        })
+        .and_then(|body| body["model"].as_str().map(str::to_string))
+}
+
+/// The `model` on every streaming leg — the agent loop's own turns.
+fn chat_turn_models(mock: &MockAiServer) -> Vec<String> {
+    mock.chat_request_bodies()
+        .into_iter()
+        .filter(|body| body["stream"].as_bool().unwrap_or(false))
+        .filter_map(|body| body["model"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Run one untitled exchange and wait for the detached title task to land,
+/// so both legs' requests are on the mock by the time a test inspects them.
+/// `list_tags` keeps the turn off the search path, which would otherwise
+/// need an embedding in whatever space the provider under test declares.
+async fn one_titled_exchange(core: &AtomicCore, mock: &MockAiServer) {
+    mock.set_chat_tool_call(Some(("list_tags", json!({}))));
+    let conversation_id = untitled_conversation(core).await;
+    let (callback, _events) = chat_event_collector(|_| {});
+    core.send_chat_message(&conversation_id, "what do I know?", callback, None)
+        .await
+        .expect("chat turn");
+    wait_until("the generated title to be persisted", || async {
+        conversation_title(core, &conversation_id).await.is_some()
+    })
+    .await;
+}
+
+/// OpenRouter is the only provider with a tagging/agentic split, and the
+/// title has to take the cheap side of it: the loop rides `chat_model`, the
+/// title rides `tagging_model`. Swapping them would silently bill every new
+/// conversation's name at agentic rates.
+#[tokio::test]
+async fn openrouter_titles_ride_the_tagging_model_not_the_chat_model() {
+    let mock = MockAiServer::start().await;
+    let handle = open_bare(Backend::Sqlite).await.expect("sqlite core");
+    let core = handle.core;
+    for (key, value) in [
+        ("provider", "openrouter"),
+        ("openrouter_api_key", "mock-openrouter-key"),
+        // Bare URL: the provider normalizes `/v1` on itself.
+        ("openrouter_base_url", mock.base_url().as_str()),
+        ("tagging_model", "mock-tagging"),
+        ("chat_model", "mock-agentic"),
+    ] {
+        core.set_setting(key, value).await.expect("seed setting");
+    }
+
+    one_titled_exchange(&core, &mock).await;
+
+    let turns = chat_turn_models(&mock);
+    assert!(!turns.is_empty(), "the agent loop should have streamed");
+    for model in &turns {
+        assert_eq!(
+            model, "mock-agentic",
+            "the agent loop rides chat_model: {turns:?}"
+        );
+    }
+    assert_eq!(
+        title_request_model(&mock).as_deref(),
+        Some("mock-tagging"),
+        "the title rides tagging_model, not the agentic model"
+    );
+}
+
+/// Ollama exposes one LLM, so both legs land on `ollama_llm_model` — and
+/// the OpenRouter-only `chat_model` / `tagging_model` keys must not reroute
+/// either leg, even when they are set.
+#[tokio::test]
+async fn ollama_titles_ride_its_single_llm_model() {
+    let mock = MockAiServer::start().await;
+    let handle = open_bare(Backend::Sqlite).await.expect("sqlite core");
+    let core = handle.core;
+    for (key, value) in [
+        ("provider", "ollama"),
+        ("ollama_host", mock.base_url().as_str()),
+        ("ollama_llm_model", "mock-ollama-llm"),
+        // Residue from a previous OpenRouter configuration. Inert here.
+        ("tagging_model", "frontier/tagging"),
+        ("chat_model", "frontier/agentic"),
+    ] {
+        core.set_setting(key, value).await.expect("seed setting");
+    }
+
+    one_titled_exchange(&core, &mock).await;
+
+    let turns = chat_turn_models(&mock);
+    assert!(!turns.is_empty(), "the agent loop should have streamed");
+    for model in &turns {
+        assert_eq!(
+            model, "mock-ollama-llm",
+            "the loop rides Ollama's single LLM: {turns:?}"
+        );
+    }
+    assert_eq!(
+        title_request_model(&mock).as_deref(),
+        Some("mock-ollama-llm"),
+        "the title rides the same single LLM"
+    );
+}
+
+/// Same contract for OpenAI-compat: one configured LLM serves both legs and
+/// the OpenRouter model keys are ignored.
+#[tokio::test]
+async fn openai_compat_titles_ride_its_single_llm_model() {
+    let mock = MockAiServer::start().await;
+    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+        .await
+        .expect("sqlite core");
+    let core = handle.core;
+    for (key, value) in [
+        ("tagging_model", "frontier/tagging"),
+        ("chat_model", "frontier/agentic"),
+    ] {
+        core.set_setting(key, value).await.expect("seed setting");
+    }
+
+    one_titled_exchange(&core, &mock).await;
+
+    let turns = chat_turn_models(&mock);
+    assert!(!turns.is_empty(), "the agent loop should have streamed");
+    for model in &turns {
+        assert_eq!(
+            model, "mock-llm",
+            "the loop rides openai_compat_llm_model: {turns:?}"
+        );
+    }
+    assert_eq!(
+        title_request_model(&mock).as_deref(),
+        Some("mock-llm"),
+        "the title rides the same single LLM"
     );
 }

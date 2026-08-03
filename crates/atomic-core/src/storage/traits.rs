@@ -660,6 +660,17 @@ pub trait SearchStore: Send + Sync {
         created_after: Option<&str>,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<ChunkSearchResult>>;
+
+    /// Which of `atom_ids` the scope admits, by the same rule the search
+    /// paths apply internally. Exposed because the tools that read an atom
+    /// *by id* (chat's `get_atom` / `get_finding`) have no query to hang a
+    /// scope on and must ask before handing content to the model. An empty
+    /// filter admits everything.
+    async fn atoms_passing_scope(
+        &self,
+        atom_ids: &[String],
+        scope: &ScopeFilter,
+    ) -> StorageResult<std::collections::HashSet<String>>;
 }
 
 // ==================== Chat Storage ====================
@@ -697,6 +708,16 @@ pub trait ChatStore: Send + Sync {
         title: Option<&str>,
         is_archived: Option<bool>,
     ) -> StorageResult<Conversation>;
+
+    /// Name a conversation only while it is still untitled, returning whether
+    /// the name landed. The auto-titler's write path: a user rename that
+    /// arrives while the title model is thinking must win, and only a
+    /// conditional UPDATE can promise that.
+    async fn set_conversation_title_if_unset(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool>;
 
     /// Delete a conversation and all its messages.
     async fn delete_conversation(&self, id: &str) -> StorageResult<()>;

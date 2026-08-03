@@ -536,3 +536,172 @@ pub async fn complete_streaming_with_tools(
         generation_id: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! What this parser does that the OpenRouter one does not.
+    //!
+    //! "OpenAI-compatible" is a family, not a spec, and the two divergences
+    //! this provider carries exist because real servers in that family
+    //! diverge: some (reasoning models behind vLLM/SGLang) put the answer in
+    //! `reasoning_content` rather than `content`, and some close the
+    //! connection without ever sending `data: [DONE]`. Both are silent
+    //! failures if the parser stops handling them — an empty answer, or a
+    //! stream that never signals completion. The shared machinery (argument
+    //! accumulation across deltas) is pinned here too because it is a second
+    //! copy of the code, free to drift from OpenRouter's.
+
+    use std::sync::{Arc, Mutex};
+
+    use atomic_test_support::MockAiServer;
+
+    use super::*;
+    use crate::providers::openai_compat::OpenAICompatProvider;
+    use crate::providers::traits::StreamingLlmProvider;
+    use crate::providers::types::GenerationParams;
+
+    /// Drive one streaming completion against a scripted body, returning the
+    /// assembled response and every delta the provider emitted, in order.
+    async fn stream(script: &str) -> (CompletionResponse, Vec<StreamDelta>) {
+        let mock = MockAiServer::start().await;
+        mock.set_stream_script(Some(script));
+        let provider = OpenAICompatProvider::new(mock.base_url(), Some("k".to_string()), Some(30));
+        let deltas = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&deltas);
+        let response = provider
+            .complete_streaming_with_tools(
+                &[Message::user("go")],
+                &[ToolDefinition::new(
+                    "search_atoms",
+                    "search",
+                    serde_json::json!({ "type": "object" }),
+                )],
+                &LlmConfig::new("mock-model").with_params(GenerationParams::new()),
+                Box::new(move |delta| sink.lock().expect("delta sink").push(delta)),
+            )
+            .await
+            .expect("streaming completion");
+        let deltas = deltas.lock().expect("delta sink").clone();
+        (response, deltas)
+    }
+
+    fn content_deltas(deltas: &[StreamDelta]) -> Vec<String> {
+        deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                StreamDelta::Content(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Servers that stream the answer as `reasoning_content` are answered
+    /// the same way as servers that use `content` — otherwise the turn
+    /// arrives empty with no error to explain it.
+    #[tokio::test]
+    async fn reasoning_content_stands_in_for_an_empty_content_field() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thought "},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"reasoning_content":"then answer"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+        assert_eq!(response.content, "thought then answer");
+        assert_eq!(content_deltas(&deltas), vec!["thought ", "then answer"]);
+    }
+
+    /// When both fields are populated, `content` wins — `reasoning_content`
+    /// is a fallback, not an addition, and concatenating both would
+    /// duplicate the answer.
+    #[tokio::test]
+    async fn content_wins_over_reasoning_content_when_both_arrive() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"content":"real","reasoning_content":"scratch"},"finish_reason":null}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+        assert_eq!(response.content, "real");
+        assert_eq!(content_deltas(&deltas), vec!["real"]);
+    }
+
+    /// A stream that just ends still reports completion. Without the
+    /// fallback the caller would wait for a `Done` that never comes.
+    #[tokio::test]
+    async fn a_stream_without_the_done_sentinel_still_completes() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"content":"all there is"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+        assert_eq!(response.content, "all there is");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert!(
+            matches!(
+                deltas.last(),
+                Some(StreamDelta::Done { finish_reason }) if finish_reason.as_deref() == Some("stop")
+            ),
+            "the close has to be synthesized: {deltas:?}"
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, StreamDelta::Done { .. }))
+                .count(),
+            1,
+            "exactly one close, never a duplicate"
+        );
+    }
+
+    /// The sentinel is not double-counted when it *is* sent.
+    #[tokio::test]
+    async fn the_done_sentinel_closes_the_stream_exactly_once() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (_response, deltas) = stream(script).await;
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, StreamDelta::Done { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// Argument accumulation, pinned independently of OpenRouter's copy.
+    #[tokio::test]
+    async fn tool_call_arguments_accumulate_across_deltas() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search_atoms","arguments":"{\"query\""}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"pelicans\"}"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+
+        let calls = response.tool_calls.expect("a tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].get_name(), Some("search_atoms"));
+        assert_eq!(calls[0].get_arguments(), Some(r#"{"query":"pelicans"}"#));
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+
+        let starts = deltas
+            .iter()
+            .filter(|d| matches!(d, StreamDelta::ToolCallStart { .. }))
+            .count();
+        assert_eq!(starts, 1, "announced once, not once per fragment");
+    }
+}

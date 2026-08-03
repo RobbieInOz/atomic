@@ -530,6 +530,8 @@ dispatch! {
         => sqlite: keyword_search_chunks_sync, pg_trait: SearchStore, pg_method: keyword_search_chunks;
     fn vector_search_chunks_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, scope: &crate::search::ScopeFilter, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<ChunkSearchResult>, AtomicCoreError>
         => sqlite: vector_search_chunks_sync, pg_trait: SearchStore, pg_method: vector_search_chunks;
+    fn atoms_passing_scope_sync(&self, atom_ids: &[String], scope: &crate::search::ScopeFilter) -> Result<HashSet<String>, AtomicCoreError>
+        => sqlite: atoms_passing_scope_sync, pg_trait: SearchStore, pg_method: atoms_passing_scope;
 
     // ---- ChatStore ----
     fn create_conversation_sync(&self, tag_ids: &[String], title: Option<&str>) -> Result<ConversationWithTags, AtomicCoreError>
@@ -540,6 +542,8 @@ dispatch! {
         => sqlite: get_conversation_sync, pg_trait: ChatStore, pg_method: get_conversation;
     fn update_conversation_sync(&self, id: &str, title: Option<&str>, is_archived: Option<bool>) -> Result<Conversation, AtomicCoreError>
         => sqlite: update_conversation_sync, pg_trait: ChatStore, pg_method: update_conversation;
+    fn set_conversation_title_if_unset_sync(&self, id: &str, title: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: set_conversation_title_if_unset_sync, pg_trait: ChatStore, pg_method: set_conversation_title_if_unset;
     fn delete_conversation_sync(&self, id: &str) -> Result<(), AtomicCoreError>
         => sqlite: delete_conversation_sync, pg_trait: ChatStore, pg_method: delete_conversation;
     fn set_conversation_scope_sync(&self, conversation_id: &str, entries: &[ScopeEntry]) -> Result<ConversationWithTags, AtomicCoreError>

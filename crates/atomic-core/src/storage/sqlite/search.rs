@@ -394,6 +394,21 @@ impl SqliteStorage {
             tags,
         })
     }
+
+    /// See [`SearchStore::atoms_passing_scope`]. Delegates to the shared
+    /// SQLite predicate every other retrieval path filters with.
+    pub(crate) fn atoms_passing_scope_sync(
+        &self,
+        atom_ids: &[String],
+        scope: &crate::search::ScopeFilter,
+    ) -> StorageResult<std::collections::HashSet<String>> {
+        if scope.is_empty() {
+            return Ok(atom_ids.iter().cloned().collect());
+        }
+        let conn = self.db.read_conn()?;
+        let ids: Vec<&str> = atom_ids.iter().map(String::as_str).collect();
+        atoms_passing_scope(&conn, &ids, scope).map_err(AtomicCoreError::Search)
+    }
 }
 
 #[async_trait]
@@ -511,6 +526,19 @@ impl SearchStore for SqliteStorage {
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn atoms_passing_scope(
+        &self,
+        atom_ids: &[String],
+        scope: &crate::search::ScopeFilter,
+    ) -> StorageResult<std::collections::HashSet<String>> {
+        let storage = self.clone();
+        let atom_ids = atom_ids.to_vec();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || storage.atoms_passing_scope_sync(&atom_ids, &scope))
+            .await
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 }
 
