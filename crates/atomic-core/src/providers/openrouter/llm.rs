@@ -535,6 +535,7 @@ async fn complete_streaming_internal(
     let mut native_finish_reason = None;
     let mut upstream_provider = None;
     let mut generation_id = None;
+    let mut done_emitted = false;
 
     let mut stream = response.bytes_stream();
 
@@ -555,6 +556,7 @@ async fn complete_streaming_internal(
 
             // Check for stream end
             if line == "data: [DONE]" {
+                done_emitted = true;
                 on_delta(StreamDelta::Done {
                     finish_reason: finish_reason.clone(),
                 });
@@ -641,6 +643,14 @@ async fn complete_streaming_internal(
         }
     }
 
+    // Some upstreams close the stream without sending [DONE] — mirror the
+    // openai_compat parser and still close out the delta stream exactly once.
+    if !done_emitted {
+        on_delta(StreamDelta::Done {
+            finish_reason: finish_reason.clone(),
+        });
+    }
+
     // Convert accumulators to ToolCall
     let tool_calls = if tool_call_accumulators.is_empty() {
         None
@@ -673,4 +683,302 @@ async fn complete_streaming_internal(
         upstream_provider,
         generation_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The streaming parser against wire shapes OpenRouter actually
+    //! produces and the generated mock responses never do.
+    //!
+    //! Two things are only reachable here. First, **argument accumulation**:
+    //! a real provider dribbles a tool call's JSON out over many deltas, and
+    //! [`ToolCallAccumulator`] exists solely to stitch them back together —
+    //! a mock that sends each call whole in one delta exercises none of it.
+    //! Second, the **OpenRouter-only metadata** (`provider`, generation `id`,
+    //! `native_finish_reason`), which is diagnostic gold when a generation
+    //! ends early and is silently dropped if the parser stops reading it.
+
+    use std::sync::{Arc, Mutex};
+
+    use atomic_test_support::MockAiServer;
+
+    use super::*;
+    use crate::providers::openrouter::OpenRouterProvider;
+    use crate::providers::traits::StreamingLlmProvider;
+    use crate::providers::types::GenerationParams;
+
+    /// Drive one streaming completion against a scripted body, returning the
+    /// assembled response and every delta the provider emitted, in order.
+    async fn stream(script: &str) -> (CompletionResponse, Vec<StreamDelta>) {
+        let mock = MockAiServer::start().await;
+        mock.set_stream_script(Some(script));
+        // A bare base URL: the provider appends `/v1` itself, which is how
+        // the request finds the mock's OpenAI-shaped route.
+        let provider = OpenRouterProvider::with_base_url("test-key".to_string(), mock.base_url());
+        let deltas = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&deltas);
+        let response = provider
+            .complete_streaming_with_tools(
+                &[Message::user("go")],
+                &[ToolDefinition::new(
+                    "search_atoms",
+                    "search",
+                    serde_json::json!({ "type": "object" }),
+                )],
+                &LlmConfig::new("mock-model").with_params(GenerationParams::new()),
+                Box::new(move |delta| sink.lock().expect("delta sink").push(delta)),
+            )
+            .await
+            .expect("streaming completion");
+        let deltas = deltas.lock().expect("delta sink").clone();
+        (response, deltas)
+    }
+
+    fn tool_arg_deltas(deltas: &[StreamDelta]) -> Vec<(usize, String)> {
+        deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                StreamDelta::ToolCallArguments { index, arguments } => {
+                    Some((*index, arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_starts(deltas: &[StreamDelta]) -> Vec<(usize, String, String)> {
+        deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                StreamDelta::ToolCallStart { index, id, name } => {
+                    Some((*index, id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tool call arriving one fragment at a time — the normal case on a
+    /// real stream — reassembles into one call with the whole argument
+    /// string, and announces itself exactly once.
+    #[tokio::test]
+    async fn tool_call_arguments_accumulate_across_deltas() {
+        let script = concat!(
+            // The opening frame names the call; arguments start empty.
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search_atoms","arguments":""}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pelic"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ans\"}"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+
+        let calls = response.tool_calls.expect("a tool call");
+        assert_eq!(calls.len(), 1, "fragments are one call, not four");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].get_name(), Some("search_atoms"));
+        assert_eq!(
+            calls[0].get_arguments(),
+            Some(r#"{"query":"pelicans"}"#),
+            "the argument string must reassemble in order"
+        );
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+
+        // Announced once, on the frame that named it — repeated starts would
+        // make a UI render a new tool card per fragment.
+        assert_eq!(
+            tool_starts(&deltas),
+            vec![(0, "call_1".to_string(), "search_atoms".to_string())]
+        );
+        // Every fragment is forwarded as it arrives, all under index 0, and
+        // together they spell the same string the accumulator built — a
+        // consumer rendering the deltas live sees exactly what the finished
+        // call says.
+        let forwarded = tool_arg_deltas(&deltas);
+        assert!(
+            forwarded.iter().all(|(index, _)| *index == 0),
+            "one call means one index: {forwarded:?}"
+        );
+        let joined: String = forwarded.into_iter().map(|(_, args)| args).collect();
+        assert_eq!(joined, r#"{"query":"pelicans"}"#);
+    }
+
+    /// Two tool calls in one turn are kept apart by their `index`, even when
+    /// their fragments interleave — which is what an accumulator keyed by
+    /// index buys over one keyed by arrival order.
+    #[tokio::test]
+    async fn parallel_tool_calls_are_kept_apart_by_index() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"second","arguments":"{\"b\":"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+
+        let calls = response.tool_calls.expect("two tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].get_name(), Some("first"));
+        assert_eq!(calls[0].get_arguments(), Some(r#"{"a":1}"#));
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].get_name(), Some("second"));
+        assert_eq!(calls[1].get_arguments(), Some(r#"{"b":2}"#));
+
+        assert_eq!(
+            tool_starts(&deltas),
+            vec![
+                (0, "call_a".to_string(), "first".to_string()),
+                (1, "call_b".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    /// A tool call whose first frame carries only an index and arguments —
+    /// no id, no name — still lands under its index. The upstream shape
+    /// exists (some endpoints send the header frame late), and dropping such
+    /// fragments would silently truncate the arguments.
+    #[tokio::test]
+    async fn argument_fragments_before_the_naming_frame_are_not_lost() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_late","type":"function","function":{"name":"search_atoms","arguments":"1}"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+
+        let calls = response.tool_calls.expect("a tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_late");
+        assert_eq!(calls[0].get_arguments(), Some(r#"{"q":1}"#));
+        assert_eq!(
+            tool_starts(&deltas),
+            vec![(0, "call_late".to_string(), "search_atoms".to_string())],
+            "the start fires once the call is nameable, not before"
+        );
+    }
+
+    /// OpenRouter's routing metadata survives the stream: which upstream
+    /// served the request, its generation id, and the upstream's raw finish
+    /// reason behind OpenRouter's normalized one. All three are what make an
+    /// early-ending generation diagnosable after the fact.
+    #[tokio::test]
+    async fn routing_metadata_and_native_finish_reason_survive() {
+        let script = concat!(
+            r#"data: {"id":"gen-abc123","provider":"Anthropic","choices":[{"delta":{"content":"partial "},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"answer"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop","native_finish_reason":"max_tokens"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+
+        assert_eq!(response.content, "partial answer");
+        assert_eq!(response.upstream_provider.as_deref(), Some("Anthropic"));
+        assert_eq!(response.generation_id.as_deref(), Some("gen-abc123"));
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            response.native_finish_reason.as_deref(),
+            Some("max_tokens"),
+            "a truncation hidden behind a normalized `stop` must still be visible"
+        );
+
+        // Content is forwarded chunk by chunk, and the sentinel closes with
+        // the finish reason the last frame carried.
+        let content: Vec<String> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                StreamDelta::Content(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, vec!["partial ", "answer"]);
+        assert!(matches!(
+            deltas.last(),
+            Some(StreamDelta::Done { finish_reason }) if finish_reason.as_deref() == Some("stop")
+        ));
+    }
+
+    /// Keep-alive comments and unparseable frames are noise, not failures:
+    /// a stream carrying them still yields the content around them.
+    #[tokio::test]
+    async fn unparseable_frames_are_skipped_rather_than_failing_the_stream() {
+        let script = concat!(
+            ": OPENROUTER PROCESSING\n\n",
+            r#"data: {"choices":[{"delta":{"content":"kept"},"finish_reason":null}]}"#,
+            "\n\n",
+            "data: {not json at all}\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (response, _deltas) = stream(script).await;
+        assert_eq!(response.content, "kept");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// A stream that just ends still reports completion — mirrored from the
+    /// openai_compat parser so the two SSE loops keep one contract.
+    #[tokio::test]
+    async fn a_stream_without_the_done_sentinel_still_completes() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"content":"all there is"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+        );
+        let (response, deltas) = stream(script).await;
+        assert_eq!(response.content, "all there is");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert!(
+            matches!(
+                deltas.last(),
+                Some(StreamDelta::Done { finish_reason }) if finish_reason.as_deref() == Some("stop")
+            ),
+            "the close has to be synthesized: {deltas:?}"
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, StreamDelta::Done { .. }))
+                .count(),
+            1,
+            "exactly one close, never a duplicate"
+        );
+    }
+
+    /// The sentinel is not double-counted when it *is* sent.
+    #[tokio::test]
+    async fn the_done_sentinel_closes_the_stream_exactly_once() {
+        let script = concat!(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (_response, deltas) = stream(script).await;
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, StreamDelta::Done { .. }))
+                .count(),
+            1
+        );
+    }
 }

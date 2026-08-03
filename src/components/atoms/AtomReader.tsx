@@ -11,6 +11,7 @@ import { useTagsStore } from '../../stores/tags';
 import { useUIStore } from '../../stores/ui';
 import { useInlineEditor } from '../../hooks';
 import { formatDate } from '../../lib/date';
+import { isTypingTarget } from '../../lib/keyboard';
 import { getTransport, isDemoInstance } from '../../lib/transport';
 import { readerEditorActions } from '../../lib/reader-editor-bridge';
 import { atomLinkExtension, type AtomLinkSuggestion, type AtomLinkSuggestionSource } from '../../editor/atom-links';
@@ -575,14 +576,6 @@ function AtomReaderContent({
       </Modal>
     </div>
   );
-}
-
-/// Whether a keystroke is destined for a real text input, so single-letter
-/// shortcuts (`i`) must not hijack it. The read-mode editor body is not
-/// contenteditable, so it never matches.
-function isTypingTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
 }
 
 function searchResultsToAtomLinkSuggestions(

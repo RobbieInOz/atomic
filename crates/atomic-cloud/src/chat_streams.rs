@@ -253,6 +253,13 @@ mod tests {
             "/api/conversations//messages",
             "/api/conversations/abc/scope",
             "/api/atoms",
+            // Cancelling is the *opposite* of starting a stream: it is a
+            // tiny write that ends one. Gating it behind the same cap would
+            // make the cap self-sealing — an account at its limit could
+            // neither start a stream nor stop one, and the only way out
+            // would be to wait. It must stay open by construction, not by
+            // the handler happening to be fast.
+            "/api/conversations/abc/messages/cancel",
         ] {
             assert!(!chat_stream_route(&post, open), "{open} must stay open");
         }
@@ -458,5 +465,74 @@ mod tests {
         )
         .await;
         assert_eq!(reopened.status(), StatusCode::OK);
+    }
+
+    /// The escape hatch, end to end through the guard: an account holding
+    /// every slot can still cancel. A saturated account whose cancels were
+    /// also refused would have no way to free a slot except waiting out the
+    /// streams it was trying to stop — the cap would trap the user inside
+    /// exactly the situation it exists to prevent.
+    #[actix_web::test]
+    async fn cancel_is_reachable_while_the_account_is_at_its_stream_cap() {
+        let limiter = ChatStreamLimiter::new(1);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(limiter.clone()))
+                .route(
+                    "/api/conversations/{id}/messages",
+                    web::post().to(|| async { HttpResponse::Ok().body("reply") }),
+                )
+                .route(
+                    "/api/conversations/{id}/messages/cancel",
+                    web::post().to(|| async {
+                        HttpResponse::Accepted().json(serde_json::json!({ "cancelled": true }))
+                    }),
+                )
+                .wrap(from_fn(chat_stream_guard))
+                .wrap(from_fn(install_tenant)),
+        )
+        .await;
+
+        // Saturate the account by holding an unconsumed response.
+        let held = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::post()
+                .uri("/api/conversations/c1/messages")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(limiter.in_flight("acct-1"), 1);
+
+        // A second stream is refused...
+        let denied = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::post()
+                .uri("/api/conversations/c2/messages")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // ...but the cancel for the stream that is holding the slot reaches
+        // its handler, and consumes no slot of its own.
+        let cancelled = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::post()
+                .uri("/api/conversations/c1/messages/cancel")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            limiter.in_flight("acct-1"),
+            1,
+            "cancelling must not take a stream slot"
+        );
+        let body: serde_json::Value = actix_test::read_body_json(cancelled).await;
+        assert_eq!(body["cancelled"], true);
+
+        drop(held);
+        assert_eq!(limiter.in_flight("acct-1"), 0);
     }
 }

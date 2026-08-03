@@ -5,4 +5,5 @@ export { ChatView } from './ChatView';
 export { ChatHeader } from './ChatHeader';
 export { ChatMessage } from './ChatMessage';
 export { ChatInput } from './ChatInput';
+export { ChatContextChip } from './ChatContextChip';
 export { ScopeEditor } from './ScopeEditor';

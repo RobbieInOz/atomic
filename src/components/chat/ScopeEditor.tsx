@@ -1,10 +1,38 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
 import { X, Plus } from 'lucide-react';
-import { ConversationWithTags, useChatStore } from '../../stores/chat';
+import { ConversationWithTags, ScopeMode, scopeModeOf, useChatStore } from '../../stores/chat';
 import { useTagsStore } from '../../stores/tags';
 
 interface ScopeEditorProps {
   conversation: ConversationWithTags;
+}
+
+// Clicking a chip walks this cycle; "Add tag" enters at the front.
+const MODE_CYCLE: ScopeMode[] = ['include', 'require', 'exclude'];
+
+const MODE_STYLE: Record<ScopeMode, { chip: string; name: string; label: string; hint: string }> = {
+  include: {
+    chip: 'bg-[var(--color-accent)]/20 text-[var(--color-accent-light)]',
+    name: '',
+    label: '',
+    hint: 'Included — a result may carry any included tag. Click to require it.',
+  },
+  require: {
+    chip: 'bg-[var(--color-accent)]/10 text-[var(--color-accent-light)] border border-[var(--color-accent)]',
+    name: '',
+    label: 'and',
+    hint: 'Required — every result must carry this tag. Click to exclude it.',
+  },
+  exclude: {
+    chip: 'bg-red-500/10 text-red-300 border border-red-500/30',
+    name: 'line-through decoration-red-400/60',
+    label: '',
+    hint: 'Excluded — no result may carry this tag. Click to include it again.',
+  },
+};
+
+function nextMode(mode: ScopeMode): ScopeMode {
+  return MODE_CYCLE[(MODE_CYCLE.indexOf(mode) + 1) % MODE_CYCLE.length];
 }
 
 // Fuzzy matching algorithm
@@ -151,13 +179,18 @@ export function ScopeEditor({ conversation }: ScopeEditorProps) {
   }, [allFlatTags, scopeTagIds, searchQuery]);
 
   const handleAddTag = async (tagId: string) => {
-    await addTagToScope(tagId);
+    await addTagToScope(tagId, 'include');
     setIsAdding(false);
     setSearchQuery('');
   };
 
   const handleRemoveTag = async (tagId: string) => {
     await removeTagFromScope(tagId);
+  };
+
+  // Same call as adding: the tag is already in scope, so this rewrites its mode.
+  const handleCycleMode = async (tagId: string, mode: ScopeMode) => {
+    await addTagToScope(tagId, nextMode(mode));
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -174,15 +207,31 @@ export function ScopeEditor({ conversation }: ScopeEditorProps) {
     <div className="flex flex-wrap items-center gap-2">
       <span className="text-xs text-[var(--color-text-tertiary)] uppercase tracking-wide">Scope:</span>
 
-      {conversation.tags.length === 0 ? (
+      {/* Without an included tag the base set is everything, and the
+          remaining chips narrow it — say so instead of leaving it implied. */}
+      {!conversation.tags.some((tag) => scopeModeOf(tag) === 'include') && (
         <span className="text-sm text-[var(--color-text-secondary)] italic">All atoms</span>
-      ) : (
-        conversation.tags.map((tag) => (
+      )}
+
+      {conversation.tags.map((tag) => {
+        const mode = scopeModeOf(tag);
+        const style = MODE_STYLE[mode];
+        return (
           <span
             key={tag.id}
-            className="group inline-flex items-center gap-1 px-2 py-0.5 text-sm rounded bg-[var(--color-accent)]/20 text-[var(--color-accent-light)]"
+            className={`group inline-flex items-center gap-1 px-2 py-0.5 text-sm rounded ${style.chip}`}
           >
-            {tag.name}
+            {style.label && (
+              <span className="text-[9px] uppercase tracking-wide opacity-70">{style.label}</span>
+            )}
+            <button
+              onClick={() => handleCycleMode(tag.id, mode)}
+              title={style.hint}
+              className={style.name}
+              aria-label={`${tag.name}: ${mode}. Change how this tag scopes the conversation`}
+            >
+              {tag.name}
+            </button>
             <button
               onClick={() => handleRemoveTag(tag.id)}
               className="opacity-0 group-hover:opacity-100 hover:text-red-400 transition-all"
@@ -191,8 +240,8 @@ export function ScopeEditor({ conversation }: ScopeEditorProps) {
               <X className="w-3 h-3" strokeWidth={2} />
             </button>
           </span>
-        ))
-      )}
+        );
+      })}
 
       {/* Add tag button/dropdown */}
       {isAdding ? (

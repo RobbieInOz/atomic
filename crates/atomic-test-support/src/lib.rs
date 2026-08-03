@@ -8,9 +8,12 @@
 //! ## What lives here
 //!
 //! - `MockAiServer`: a wiremock-backed server that responds to
-//!   `/v1/embeddings` and `/v1/chat/completions` with deterministic output.
-//! - `EMBED_DIM` and `EDGE_SIMILARITY_THRESHOLD`: shared constants pinned
-//!   to the default provider/embedding-pipeline config so tests don't drift.
+//!   `/v1/embeddings` and `/v1/chat/completions` (OpenAI-compat and
+//!   OpenRouter) plus `/api/embed` and `/api/chat` (Ollama) with
+//!   deterministic output.
+//! - `EMBED_DIM`, `OLLAMA_EMBED_DIM` and `EDGE_SIMILARITY_THRESHOLD`: shared
+//!   constants pinned to the default provider/embedding-pipeline config so
+//!   tests don't drift.
 //! - `truncate_postgres_for_test`: ready-made truncation helper for the
 //!   per-DB tables used by integration tests. Behind the `postgres`
 //!   feature so default consumers don't pull sqlx.
@@ -30,7 +33,9 @@ pub mod mock_url;
 #[cfg(feature = "postgres")]
 pub mod postgres_helpers;
 
-pub use mock_ai::{InjectedFailure, MockAiServer, EDGE_SIMILARITY_THRESHOLD, EMBED_DIM};
+pub use mock_ai::{
+    InjectedFailure, MockAiServer, EDGE_SIMILARITY_THRESHOLD, EMBED_DIM, OLLAMA_EMBED_DIM,
+};
 pub use mock_url::{MockUrlServer, SLOW_FEED_DELAY};
 
 #[cfg(feature = "postgres")]

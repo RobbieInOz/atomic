@@ -49,6 +49,7 @@ impl TestServer {
             dangerously_skip_setup_token: false,
             setup_claim_lock: tokio::sync::Mutex::new(()),
             setup_claim_limiter: SetupClaimLimiter::new(),
+            chat_cancellations: Default::default(),
         });
         let transport = AtomicMcpTransport::new(manager, event_tx, Duration::from_secs(30));
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

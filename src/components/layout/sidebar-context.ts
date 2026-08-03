@@ -8,11 +8,14 @@ export type SidebarContext =
   | { kind: 'toc'; source: 'atom' | 'wiki' | 'finding' }
   | { kind: 'wiki-list' }
   | { kind: 'recent' }
-  | { kind: 'findings'; reportId: string | null };
+  | { kind: 'findings'; reportId: string | null }
+  | { kind: 'conversations' };
 
 /// The slices `deriveSidebarContext` reads. Structurally a subset of the UI
 /// store, so the store's state can be passed straight in.
 export interface SidebarContextInput {
+  chatSidebarOpen: boolean;
+  chatSidebarExpanded: boolean;
   localGraph: { isOpen: boolean };
   readerState: { atomId: string | null };
   wikiReaderState: { tagId: string | null };
@@ -27,6 +30,7 @@ export const SIDEBAR_CONTEXT_TITLES: Record<SidebarContext['kind'], string> = {
   'wiki-list': 'Articles',
   recent: 'Recent',
   findings: 'Findings',
+  conversations: 'Conversations',
 };
 
 /// Decide the sidebar's content from the projected reader slices.
@@ -40,6 +44,11 @@ export const SIDEBAR_CONTEXT_TITLES: Record<SidebarContext['kind'], string> = {
 /// `wikiReaderState.tagName`; those are written atomically with the ids they
 /// accompany by `projectActiveEntry`, so testing the ids alone is equivalent.
 export function deriveSidebarContext(s: SidebarContextInput): SidebarContext {
+  // Fullscreen chat outranks the mirror below rather than sitting inside it:
+  // the readers and views those branches describe are all hidden behind the
+  // expanded pane, so the only navigation that means anything is the chat's
+  // own list of conversations.
+  if (s.chatSidebarExpanded && s.chatSidebarOpen) return { kind: 'conversations' };
   if (s.localGraph.isOpen) return { kind: 'tags' };
   if (s.readerState.atomId) return { kind: 'toc', source: 'atom' };
   if (s.wikiReaderState.tagId) return { kind: 'toc', source: 'wiki' };

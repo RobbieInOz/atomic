@@ -326,6 +326,12 @@ async fn demo_whitelist_serves_reads_and_refuses_everything_else() {
             (Method::PUT, "/api/settings/onboarding_completed"),
             (Method::GET, "/api/conversations"),
             (Method::POST, "/api/conversations"),
+            // The whole chat surface, not just its collection: spending a
+            // turn is the demo's most expensive possible action, and
+            // cancelling reaches into a process-wide registry.
+            (Method::POST, "/api/conversations/c-1/messages"),
+            (Method::POST, "/api/conversations/c-1/messages/cancel"),
+            (Method::POST, "/api/conversations/c-1/scope/tags"),
             (Method::POST, "/api/databases/default/exports/markdown"),
             (Method::GET, "/api/feeds"),
             (Method::GET, "/api/auth/tokens"),

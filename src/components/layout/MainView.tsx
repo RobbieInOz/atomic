@@ -79,9 +79,15 @@ export function MainView() {
 
   const chatSidebarOpen = useUIStore(s => s.chatSidebarOpen);
   const chatSidebarWidth = useUIStore(s => s.chatSidebarWidth);
+  const chatSidebarExpanded = useUIStore(s => s.chatSidebarExpanded);
   const setChatSidebarWidth = useUIStore(s => s.setChatSidebarWidth);
   const toggleChatSidebar = useUIStore(s => s.toggleChatSidebar);
   const [isResizingChat, setIsResizingChat] = useState(false);
+
+  // Desktop fullscreen chat: the whole main column, titlebar included, gives way
+  // to the chat pane. Width is untouched by expanding, so minimizing restores
+  // whatever the user had dragged the pane to.
+  const isChatFullscreen = chatSidebarOpen && chatSidebarExpanded;
 
   const [filterBarOpen, setFilterBarOpen] = useState(false);
   const isMobile = useIsMobile();
@@ -241,7 +247,15 @@ export function MainView() {
 
   return (
     <>
-    <main className="relative flex-1 flex flex-col h-full bg-[var(--color-bg-main)] overflow-hidden">
+    {/* Expanding chat collapses this column — titlebar and all — to nothing
+        rather than unmounting it: SigmaCanvas would take a fresh WebGL context
+        on every remount, and browsers hand out a limited number of them
+        (v1.39). */}
+    <main
+      className={`relative flex-1 flex flex-col h-full bg-[var(--color-bg-main)] overflow-hidden ${
+        isChatFullscreen ? 'md:flex-none md:w-0' : ''
+      }`}
+    >
       {/* Titlebar row — the row itself is a Tauri drag region; interactive
           elements inside it (buttons, tabs) receive their own events normally. */}
       <div
@@ -516,7 +530,8 @@ export function MainView() {
     />
 
     {/* Chat sidebar — available in all views.
-        Desktop: flex sibling that animates width.
+        Desktop: flex sibling that animates width, or claims the whole row when
+        expanded to fullscreen.
         Mobile: fixed overlay that slides in from the right. */}
     <div
       className={`
@@ -527,15 +542,20 @@ export function MainView() {
         ${isResizingChat ? '' : 'transition-[width,transform] duration-300 ease-in-out'}
         ${chatSidebarOpen ? 'max-md:translate-x-0' : 'max-md:translate-x-full'}
         ${chatSidebarOpen ? '' : 'md:!w-0 md:border-l-0'}
+        ${isChatFullscreen ? 'md:flex-1' : ''}
       `}
       style={{ '--chat-w': `${chatSidebarWidth}px` } as React.CSSProperties}
     >
-      {/* Resize handle — desktop only */}
-      <div
-        className="hidden md:block absolute left-0 top-0 h-full w-1.5 cursor-col-resize z-10 hover:bg-[var(--color-accent)]/20 active:bg-[var(--color-accent)]/30"
-        onMouseDown={handleChatResizeStart}
-      />
-      <div className="w-full md:min-w-[var(--chat-w)] h-full">
+      {/* Resize handle — desktop only, and meaningless at fullscreen */}
+      {!isChatFullscreen && (
+        <div
+          className="hidden md:block absolute left-0 top-0 h-full w-1.5 cursor-col-resize z-10 hover:bg-[var(--color-accent)]/20 active:bg-[var(--color-accent)]/30"
+          onMouseDown={handleChatResizeStart}
+        />
+      )}
+      {/* The min-width keeps the pane's contents from reflowing as it animates
+          shut; at fullscreen there is no such floor to hold. */}
+      <div className={`w-full h-full ${isChatFullscreen ? '' : 'md:min-w-[var(--chat-w)]'}`}>
         <ChatViewer />
       </div>
     </div>

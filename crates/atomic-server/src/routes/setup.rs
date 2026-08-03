@@ -185,6 +185,7 @@ mod tests {
             dangerously_skip_setup_token,
             setup_claim_lock: Mutex::new(()),
             setup_claim_limiter: SetupClaimLimiter::new(),
+            chat_cancellations: Default::default(),
         });
         std::mem::forget(temp);
         state

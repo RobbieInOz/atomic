@@ -83,8 +83,15 @@ These power progress UI for Obsidian import, URL ingestion, browser clipping, iO
 - `ChatComplete`
 - `ChatCanvasAction`
 - `ChatError`
+- `ChatConversationUpdated`
 
 The message send endpoint returns a final response, but the UI receives streaming deltas and tool events over WebSocket.
+
+### `ChatStreamDelta.content` is incremental
+
+Each `ChatStreamDelta` carries **only the new text** produced since the previous delta. Clients append them; the concatenation of every delta for a `conversation_id` is the assistant's answer, and `ChatComplete` carries the authoritative full message.
+
+This is a behavior change under an unchanged event name. Earlier builds sent the **cumulative** text so far in each delta, so a client written against them could replace its buffer on every delta and still render correctly. That client now renders only the last fragment. If you maintain a raw WebSocket client, switch it from replace to append — there is no version flag to branch on, and no way to tell the two shapes apart from a single delta.
 
 ## Dashboard Events
 

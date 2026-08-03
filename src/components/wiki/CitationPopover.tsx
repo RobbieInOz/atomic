@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ArrowRight } from 'lucide-react';
+import { ArrowRight, BookOpen, Telescope } from 'lucide-react';
 import { useKeyboard } from '../../hooks/useKeyboard';
 
 // Generic citation interface that works with both WikiCitation and ChatCitation
@@ -10,7 +10,19 @@ export interface CitationForPopover {
   citation_index: number;
   atom_id: string;
   excerpt: string;
+  // Chat citations can point at a wiki article or a report finding instead
+  // of an atom. Everything else cites atoms only and omits this.
+  source_type?: 'atom' | 'wiki' | 'finding';
+  source_title?: string | null;
 }
+
+// How each kind of source names itself. Atoms keep the original wording so
+// the wiki, dashboard and finding readers are untouched by chat's sources.
+const SOURCE_LABELS = {
+  atom: { kind: 'Source excerpt', open: 'View full atom', Icon: null },
+  wiki: { kind: 'Wiki excerpt', open: 'View wiki article', Icon: BookOpen },
+  finding: { kind: 'Finding excerpt', open: 'View finding', Icon: Telescope },
+} as const;
 
 interface CitationPopoverProps {
   citation: CitationForPopover;
@@ -89,6 +101,8 @@ export function CitationPopover({ citation, anchorRect, onClose, onViewAtom }: C
     onClose();
   };
 
+  const source = SOURCE_LABELS[citation.source_type ?? 'atom'];
+
   // Truncate excerpt if needed
   const displayExcerpt = citation.excerpt.length > 300
     ? citation.excerpt.slice(0, 297) + '...'
@@ -114,7 +128,12 @@ export function CitationPopover({ citation, anchorRect, onClose, onViewAtom }: C
         <span className="inline-flex items-center justify-center w-6 h-6 rounded bg-[var(--color-accent)]/20 text-[var(--color-accent-light)] text-xs font-medium">
           {citation.citation_index}
         </span>
-        <span className="text-xs text-[var(--color-text-secondary)]">Source excerpt</span>
+        {source.Icon && (
+          <source.Icon className="w-3.5 h-3.5 text-[var(--color-text-tertiary)]" strokeWidth={2} />
+        )}
+        <span className="text-xs text-[var(--color-text-secondary)]">
+          {citation.source_title ? `${source.kind} — ${citation.source_title}` : source.kind}
+        </span>
       </div>
 
       {/* Excerpt content */}
@@ -130,7 +149,7 @@ export function CitationPopover({ citation, anchorRect, onClose, onViewAtom }: C
           onClick={handleViewAtom}
           className="flex items-center gap-1 text-sm text-[var(--color-accent)] hover:text-[var(--color-accent-light)] transition-colors"
         >
-          View full atom
+          {source.open}
           <ArrowRight className="w-4 h-4" strokeWidth={2} />
         </button>
       </div>

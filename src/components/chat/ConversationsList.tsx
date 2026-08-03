@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Plus, MessageCircle } from 'lucide-react';
 import { useChatStore, ConversationWithTags } from '../../stores/chat';
+import { useUIStore } from '../../stores/ui';
 import { ConversationCard } from './ConversationCard';
 import { Modal } from '../ui/Modal';
 
@@ -9,18 +10,26 @@ export function ConversationsList() {
   const isLoading = useChatStore(s => s.isLoading);
   const error = useChatStore(s => s.error);
   const listFilterTagId = useChatStore(s => s.listFilterTagId);
+  const showArchived = useChatStore(s => s.showArchived);
+  const setShowArchived = useChatStore(s => s.setShowArchived);
   const createConversation = useChatStore(s => s.createConversation);
   const openConversation = useChatStore(s => s.openConversation);
   const deleteConversation = useChatStore(s => s.deleteConversation);
+  const updateConversationTitle = useChatStore(s => s.updateConversationTitle);
+  const setConversationArchived = useChatStore(s => s.setConversationArchived);
+  const selectedTagId = useUIStore(s => s.selectedTagId);
 
   const [deleteTarget, setDeleteTarget] = useState<ConversationWithTags | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
   const handleNewChat = async () => {
     try {
-      // Create conversation with current filter tag if any
-      const tagIds = listFilterTagId ? [listFilterTagId] : [];
-      await createConversation(tagIds);
+      // Scope the new conversation to whatever the user is already looking
+      // at: the list's own tag filter, or the tag selected in the sidebar.
+      // The chip is removable in the header's ScopeEditor, so this is a
+      // suggestion, not a commitment.
+      const scopeTagId = listFilterTagId ?? selectedTagId;
+      await createConversation(scopeTagId ? [scopeTagId] : []);
     } catch (e) {
       console.error('Failed to create conversation:', e);
     }
@@ -86,9 +95,13 @@ export function ConversationsList() {
               <MessageCircle className="w-8 h-8 text-[var(--color-text-secondary)]" strokeWidth={2} />
             </div>
             <div>
-              <p className="text-[var(--color-text-primary)] font-medium mb-1">No conversations yet</p>
+              <p className="text-[var(--color-text-primary)] font-medium mb-1">
+                {showArchived ? 'Nothing here' : 'No conversations yet'}
+              </p>
               <p className="text-[var(--color-text-secondary)] text-sm">
-                Start a new conversation to chat with your knowledge base
+                {showArchived
+                  ? 'No conversations, archived or otherwise'
+                  : 'Start a new conversation to chat with your knowledge base'}
               </p>
             </div>
           </div>
@@ -100,10 +113,22 @@ export function ConversationsList() {
                 conversation={conversation}
                 onClick={() => handleOpenConversation(conversation)}
                 onDelete={(e) => handleDeleteClick(conversation, e)}
+                onRename={(title) => updateConversationTitle(conversation.id, title)}
+                onArchive={(isArchived) => setConversationArchived(conversation.id, isArchived)}
               />
             ))}
           </div>
         )}
+      </div>
+
+      {/* Archive visibility */}
+      <div className="flex-shrink-0 px-4 py-2 border-t border-[var(--color-border)]">
+        <button
+          onClick={() => setShowArchived(!showArchived)}
+          className="text-xs text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] transition-colors"
+        >
+          {showArchived ? 'Hide archived' : 'Show archived'}
+        </button>
       </div>
 
       {/* Delete Confirmation Modal */}

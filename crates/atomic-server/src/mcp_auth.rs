@@ -178,6 +178,7 @@ mod tests {
             dangerously_skip_setup_token: false,
             setup_claim_lock: tokio::sync::Mutex::new(()),
             setup_claim_limiter: crate::state::SetupClaimLimiter::new(),
+            chat_cancellations: Default::default(),
         });
         std::mem::forget(temp);
         (state, raw_token)

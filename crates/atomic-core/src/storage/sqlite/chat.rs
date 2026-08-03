@@ -1,6 +1,7 @@
 use super::SqliteStorage;
 use crate::error::AtomicCoreError;
 use crate::models::*;
+use crate::search::ScopeFilter;
 use crate::storage::traits::*;
 use async_trait::async_trait;
 
@@ -24,9 +25,10 @@ impl SqliteStorage {
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>> {
         let conn = self.db.read_conn()?;
-        crate::chat::get_conversations(&conn, filter_tag_id, limit, offset)
+        crate::chat::get_conversations(&conn, filter_tag_id, limit, offset, include_archived)
     }
 
     pub(crate) fn get_conversation_sync(
@@ -51,6 +53,19 @@ impl SqliteStorage {
         crate::chat::update_conversation(&conn, id, title, is_archived)
     }
 
+    pub(crate) fn set_conversation_title_if_unset_sync(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        crate::chat::set_title_if_unset(&conn, id, title)
+    }
+
     pub(crate) fn delete_conversation_sync(&self, id: &str) -> StorageResult<()> {
         let conn = self
             .db
@@ -67,27 +82,28 @@ impl SqliteStorage {
     pub(crate) fn set_conversation_scope_sync(
         &self,
         conversation_id: &str,
-        tag_ids: &[String],
+        entries: &[ScopeEntry],
     ) -> StorageResult<ConversationWithTags> {
         let conn = self
             .db
             .conn
             .lock()
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
-        crate::chat::set_conversation_scope(&conn, conversation_id, tag_ids)
+        crate::chat::set_conversation_scope(&conn, conversation_id, entries)
     }
 
     pub(crate) fn add_tag_to_scope_sync(
         &self,
         conversation_id: &str,
         tag_id: &str,
+        mode: ScopeMode,
     ) -> StorageResult<ConversationWithTags> {
         let conn = self
             .db
             .conn
             .lock()
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
-        crate::chat::add_tag_to_scope(&conn, conversation_id, tag_id)
+        crate::chat::add_tag_to_scope(&conn, conversation_id, tag_id, mode)
     }
 
     pub(crate) fn remove_tag_from_scope_sync(
@@ -157,25 +173,25 @@ impl SqliteStorage {
         crate::chat::save_citations(&conn, message_id, citations)
     }
 
-    pub(crate) fn get_scope_tag_ids_sync(
+    pub(crate) fn get_conversation_scope_sync(
         &self,
         conversation_id: &str,
-    ) -> StorageResult<Vec<String>> {
+    ) -> StorageResult<ScopeFilter> {
         let conn = self
             .db
             .conn
             .lock()
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
-        crate::chat::get_scope_tag_ids(&conn, conversation_id)
+        crate::chat::get_conversation_scope(&conn, conversation_id)
     }
 
-    pub(crate) fn get_scope_description_sync(&self, tag_ids: &[String]) -> StorageResult<String> {
+    pub(crate) fn get_scope_description_sync(&self, scope: &ScopeFilter) -> StorageResult<String> {
         let conn = self
             .db
             .conn
             .lock()
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
-        Ok(crate::chat::get_scope_description(&conn, tag_ids))
+        Ok(crate::chat::get_scope_description(&conn, scope))
     }
 }
 
@@ -201,11 +217,17 @@ impl ChatStore for SqliteStorage {
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>> {
         let storage = self.clone();
         let filter_tag_id = filter_tag_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            storage.get_conversations_sync(filter_tag_id.as_deref(), limit, offset)
+            storage.get_conversations_sync(
+                filter_tag_id.as_deref(),
+                limit,
+                offset,
+                include_archived,
+            )
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
@@ -238,6 +260,21 @@ impl ChatStore for SqliteStorage {
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 
+    async fn set_conversation_title_if_unset(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool> {
+        let storage = self.clone();
+        let id = id.to_string();
+        let title = title.to_string();
+        tokio::task::spawn_blocking(move || {
+            storage.set_conversation_title_if_unset_sync(&id, &title)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
     async fn delete_conversation(&self, id: &str) -> StorageResult<()> {
         let storage = self.clone();
         let id = id.to_string();
@@ -249,13 +286,13 @@ impl ChatStore for SqliteStorage {
     async fn set_conversation_scope(
         &self,
         conversation_id: &str,
-        tag_ids: &[String],
+        entries: &[ScopeEntry],
     ) -> StorageResult<ConversationWithTags> {
         let storage = self.clone();
         let conversation_id = conversation_id.to_string();
-        let tag_ids = tag_ids.to_vec();
+        let entries = entries.to_vec();
         tokio::task::spawn_blocking(move || {
-            storage.set_conversation_scope_sync(&conversation_id, &tag_ids)
+            storage.set_conversation_scope_sync(&conversation_id, &entries)
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
@@ -265,12 +302,13 @@ impl ChatStore for SqliteStorage {
         &self,
         conversation_id: &str,
         tag_id: &str,
+        mode: ScopeMode,
     ) -> StorageResult<ConversationWithTags> {
         let storage = self.clone();
         let conversation_id = conversation_id.to_string();
         let tag_id = tag_id.to_string();
         tokio::task::spawn_blocking(move || {
-            storage.add_tag_to_scope_sync(&conversation_id, &tag_id)
+            storage.add_tag_to_scope_sync(&conversation_id, &tag_id, mode)
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
@@ -334,18 +372,18 @@ impl ChatStore for SqliteStorage {
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 
-    async fn get_scope_tag_ids(&self, conversation_id: &str) -> StorageResult<Vec<String>> {
+    async fn get_conversation_scope(&self, conversation_id: &str) -> StorageResult<ScopeFilter> {
         let storage = self.clone();
         let conversation_id = conversation_id.to_string();
-        tokio::task::spawn_blocking(move || storage.get_scope_tag_ids_sync(&conversation_id))
+        tokio::task::spawn_blocking(move || storage.get_conversation_scope_sync(&conversation_id))
             .await
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 
-    async fn get_scope_description(&self, tag_ids: &[String]) -> StorageResult<String> {
+    async fn get_scope_description(&self, scope: &ScopeFilter) -> StorageResult<String> {
         let storage = self.clone();
-        let tag_ids = tag_ids.to_vec();
-        tokio::task::spawn_blocking(move || storage.get_scope_description_sync(&tag_ids))
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || storage.get_scope_description_sync(&scope))
             .await
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }

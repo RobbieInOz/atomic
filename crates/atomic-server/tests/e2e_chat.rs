@@ -548,3 +548,150 @@ async fn run_chat_requires_auth(backend: Backend) {
 
     server.stop().await;
 }
+
+// ==================== 6. Cancelling a running turn ====================
+
+#[actix_web::test]
+async fn cancel_stops_a_running_turn_sqlite() {
+    run_cancel_stops_a_running_turn(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn cancel_stops_a_running_turn_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!("cancel_stops_a_running_turn_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        return;
+    }
+    run_cancel_stops_a_running_turn(Backend::Postgres).await;
+}
+
+/// `POST /api/conversations/{id}/messages/cancel` reaches the turn started
+/// by a *different* in-flight request and stops it, and the stopped turn
+/// still returns its (marked) message through the normal path.
+///
+/// The registry that makes this work lives in `AppState`, so nothing below
+/// the HTTP layer can prove the wiring: the send handler has to register the
+/// turn under the same key the cancel handler looks it up by, and the flag
+/// has to reach `atomic-core`'s agent loop.
+async fn run_cancel_stops_a_running_turn(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    // A model that never stops researching, answering slowly — so the turn
+    // is reliably still running when the cancel arrives.
+    ctx.mock.set_chat_force_tool_calls(true);
+    ctx.mock
+        .set_chat_delay(Some(Duration::from_millis(200)));
+
+    let server = spawn_live_server(&ctx).await;
+    let client = reqwest::Client::new();
+    let conv_id = create_conversation(&client, &server.base_url, &ctx.token, &[]).await;
+
+    let send_handle = {
+        let base_url = server.base_url.clone();
+        let token = ctx.token.clone();
+        let conv_id = conv_id.clone();
+        tokio::spawn(async move {
+            let resp = reqwest::Client::new()
+                .post(format!(
+                    "{}/api/conversations/{}/messages",
+                    base_url, conv_id
+                ))
+                .bearer_auth(&token)
+                .json(&json!({ "content": "keep digging forever" }))
+                .send()
+                .await
+                .expect("POST /api/conversations/{id}/messages");
+            assert!(
+                resp.status().is_success(),
+                "a stopped turn still returns 200, got {}",
+                resp.status()
+            );
+            resp.json::<Value>().await.expect("parse chat reply")
+        })
+    };
+
+    // Retry until the turn has registered — cancelling before the handler
+    // starts is a legitimate no-op, not a failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut signalled = false;
+    while !signalled {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn never became cancellable"
+        );
+        let resp = client
+            .post(format!(
+                "{}/api/conversations/{}/messages/cancel",
+                server.base_url, conv_id
+            ))
+            .bearer_auth(&ctx.token)
+            .send()
+            .await
+            .expect("POST .../messages/cancel");
+        assert_eq!(
+            resp.status().as_u16(),
+            202,
+            "cancelling is always accepted, running or not"
+        );
+        let body: Value = resp.json().await.expect("parse cancel reply");
+        signalled = body["cancelled"].as_bool().expect("cancelled flag");
+        if !signalled {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let reply = send_handle.await.expect("send task joined");
+    let content = reply["content"].as_str().unwrap_or_default();
+    assert!(
+        content.contains("*(stopped)*"),
+        "the partial answer is marked stopped; got {reply}"
+    );
+
+    // And that is what the conversation now holds.
+    let stored: Value = client
+        .get(format!(
+            "{}/api/conversations/{}",
+            server.base_url, conv_id
+        ))
+        .bearer_auth(&ctx.token)
+        .send()
+        .await
+        .expect("GET conversation")
+        .json()
+        .await
+        .expect("parse conversation");
+    let last = stored["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .cloned()
+        .expect("assistant message persisted");
+    assert_eq!(last["role"], "assistant");
+    assert_eq!(last["content"], content);
+
+    server.stop().await;
+}
+
+#[actix_web::test]
+async fn cancel_requires_auth_sqlite() {
+    let Some(ctx) = TestCtx::new(Backend::Sqlite).await else {
+        return;
+    };
+    let server = spawn_live_server(&ctx).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/conversations/00000000-0000-0000-0000-000000000000/messages/cancel",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("cancel without auth");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "cancel is behind the same bearer gate as the turn it stops"
+    );
+
+    server.stop().await;
+}

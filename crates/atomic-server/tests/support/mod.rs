@@ -184,6 +184,7 @@ impl TestCtx {
             dangerously_skip_setup_token: opts.dangerously_skip_setup_token,
             setup_claim_lock: tokio::sync::Mutex::new(()),
             setup_claim_limiter: SetupClaimLimiter::new(),
+            chat_cancellations: Default::default(),
         });
 
         Some(TestCtx {

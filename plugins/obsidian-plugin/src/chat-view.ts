@@ -623,6 +623,9 @@ export class ChatView extends ItemView {
       const index = parseInt(idxStr, 10);
       const cit = byIndex.get(index);
       if (!cit) return match;
+      // Wiki articles and findings have no vault note and no atom to fetch;
+      // their marker stays plain text rather than becoming a dead link.
+      if (cit.source_type && cit.source_type !== "atom") return match;
 
       const atom = this.atomCache.get(cit.atom_id);
       const url = atom?.source_url ?? null;

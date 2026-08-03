@@ -760,6 +760,87 @@ pub struct CanvasLevel {
 // These are included here for use by the Tauri app's chat functionality,
 // even though chat is not part of atomic-core's scope.
 
+/// The role a tag plays in a conversation's scope.
+///
+/// `Include` is the historical behavior and the default every pre-boolean
+/// row and client gets: an atom carrying any include tag is in scope.
+/// `Require` narrows (every require tag must be present), `Exclude` removes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum ScopeMode {
+    #[default]
+    Include,
+    Require,
+    Exclude,
+}
+
+impl ScopeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeMode::Include => "include",
+            ScopeMode::Require => "require",
+            ScopeMode::Exclude => "exclude",
+        }
+    }
+
+    /// Read a stored mode. Anything unrecognized reads as `Include` so a
+    /// value written by a newer version can never widen an existing scope.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "require" => ScopeMode::Require,
+            "exclude" => ScopeMode::Exclude,
+            _ => ScopeMode::Include,
+        }
+    }
+}
+
+/// One tag's membership in a conversation's scope, as clients send it.
+///
+/// Deserializes from either `{"tag_id": "...", "mode": "exclude"}` or a bare
+/// tag id string — the shape every client sent before modes existed, which
+/// means include.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ScopeEntry {
+    pub tag_id: String,
+    #[serde(default)]
+    pub mode: ScopeMode,
+}
+
+impl<'de> Deserialize<'de> for ScopeEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Id(String),
+            Entry {
+                tag_id: String,
+                #[serde(default)]
+                mode: ScopeMode,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Id(tag_id) => ScopeEntry {
+                tag_id,
+                mode: ScopeMode::Include,
+            },
+            Repr::Entry { tag_id, mode } => ScopeEntry { tag_id, mode },
+        })
+    }
+}
+
+/// A scope tag as clients read it: the whole tag plus its mode. Flattened so
+/// the JSON stays the tag object it has always been, with `mode` added.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ScopeTag {
+    #[serde(flatten)]
+    pub tag: Tag,
+    #[serde(default)]
+    pub mode: ScopeMode,
+}
+
 /// Chat conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -777,7 +858,7 @@ pub struct Conversation {
 pub struct ConversationWithTags {
     #[serde(flatten)]
     pub conversation: Conversation,
-    pub tags: Vec<Tag>,
+    pub tags: Vec<ScopeTag>,
     pub message_count: i32,
     pub last_message_preview: Option<String>,
 }
@@ -788,7 +869,7 @@ pub struct ConversationWithTags {
 pub struct ConversationWithMessages {
     #[serde(flatten)]
     pub conversation: Conversation,
-    pub tags: Vec<Tag>,
+    pub tags: Vec<ScopeTag>,
     pub messages: Vec<ChatMessageWithContext>,
 }
 
@@ -828,17 +909,44 @@ pub struct ChatToolCall {
     pub completed_at: Option<String>,
 }
 
-/// Citation in a chat message
+/// Citation in a chat message.
+///
+/// A citation points at whatever kind of source the answer cited, which
+/// `source_type` names: `atom` (the default, and what every row written
+/// before source types existed is), `wiki`, or `finding`. `atom_id` is the
+/// id of that source — an atom id, the *tag* id of a wiki article, or the
+/// finding atom's id — so exactly one id column is ever meaningful. Neither
+/// backend constrains that column any more: Postgres never declared a foreign
+/// key on it, and SQLite's `REFERENCES atoms(id)` — which *was* enforced, our
+/// bundled SQLite defaulting `foreign_keys` on — was dropped in the v23 table
+/// rebuild, because a wiki citation's id belongs to a tag. Deleting a source
+/// consequently leaves its citations behind as dead links, which is how the
+/// readers already render a source that has gone missing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ChatCitation {
     pub id: String,
     pub message_id: String,
     pub citation_index: i32,
+    /// The cited source's id, read according to `source_type`.
     pub atom_id: String,
     pub chunk_index: Option<i32>,
     pub excerpt: String,
     pub relevance_score: Option<f32>,
+    /// `atom` | `wiki` | `finding`. Defaults to `atom` so clients and rows
+    /// that predate source types keep working.
+    #[serde(default = "default_citation_source_type")]
+    pub source_type: String,
+    /// Display name for sources the UI can't name from an id alone — the
+    /// tag name behind a wiki citation. Resolved at read time (not stored),
+    /// so a renamed tag reads back correctly; `None` for atoms and
+    /// findings, whose titles the reader already loads with the atom.
+    #[serde(default)]
+    pub source_title: Option<String>,
+}
+
+fn default_citation_source_type() -> String {
+    "atom".to_string()
 }
 
 // ==================== Feed Types ====================
@@ -1507,4 +1615,48 @@ pub struct ReportFindingCitation {
     pub cited_atom_id: String,
     pub position: i32,
     pub excerpt: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_entry_accepts_a_bare_tag_id() {
+        // Every client that predates boolean scope sends `["tag-a"]`; that
+        // has to keep meaning "include tag-a" rather than failing the request.
+        let entries: Vec<ScopeEntry> =
+            serde_json::from_str(r#"["tag-a", {"tag_id": "tag-b", "mode": "exclude"}]"#)
+                .expect("mixed scope payload");
+        assert_eq!(entries[0].tag_id, "tag-a");
+        assert_eq!(entries[0].mode, ScopeMode::Include);
+        assert_eq!(entries[1].tag_id, "tag-b");
+        assert_eq!(entries[1].mode, ScopeMode::Exclude);
+
+        // An object without a mode is an include too.
+        let bare: ScopeEntry =
+            serde_json::from_str(r#"{"tag_id": "tag-c"}"#).expect("modeless entry");
+        assert_eq!(bare.mode, ScopeMode::Include);
+    }
+
+    #[test]
+    fn scope_tag_serializes_flat_with_its_mode() {
+        // The UI reads a scope tag as the tag object it has always been,
+        // plus `mode` — nothing nested, nothing renamed.
+        let json = serde_json::to_value(ScopeTag {
+            tag: Tag {
+                id: "tag-a".into(),
+                name: "Rust".into(),
+                parent_id: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                is_autotag_target: false,
+                autotag_description: String::new(),
+            },
+            mode: ScopeMode::Require,
+        })
+        .expect("serialize scope tag");
+        assert_eq!(json["id"], "tag-a");
+        assert_eq!(json["name"], "Rust");
+        assert_eq!(json["mode"], "require");
+    }
 }

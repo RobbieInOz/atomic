@@ -149,6 +149,12 @@ export function ContextMenu({ items, position, onClose, autoFocus = false }: Con
     <div
       ref={menuRef}
       role="menu"
+      /* An open menu owns Escape and the click that closes it — the same
+         claim Modal and the palettes make. Without the marker, a capture-phase
+         Escape handler further out (fullscreen chat's, which stops the event
+         there) closes itself and leaves this menu floating over a view it no
+         longer belongs to. */
+      data-modal="true"
       onKeyDown={onMenuKeyDown}
       className="fixed z-50 min-w-[160px] bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-lg shadow-xl py-1 animate-in fade-in zoom-in-95 duration-100"
       style={{

@@ -1,8 +1,9 @@
 import { useState, useCallback, Fragment, ReactNode, useEffect, useMemo } from 'react';
-import { CheckCircle2, Loader2, Wrench, XCircle } from 'lucide-react';
-import { ChatMessageWithContext, ChatCitation, ChatToolCall } from '../../stores/chat';
+import { BookOpen, Check, CheckCircle2, FilePlus, Loader2, Telescope, Wrench, XCircle } from 'lucide-react';
+import { ChatMessageWithContext, ChatCitation, ChatToolCall, useChatStore } from '../../stores/chat';
 import { useAtomsStore, type AtomSummary, type AtomWithTags } from '../../stores/atoms';
-import { getTransport } from '../../lib/transport';
+import { useUIStore } from '../../stores/ui';
+import { getTransport, isDemoInstance } from '../../lib/transport';
 import { CitationLink, CitationPopover } from '../wiki';
 import { MarkdownImage } from '../ui/MarkdownImage';
 import ReactMarkdown from 'react-markdown';
@@ -20,6 +21,8 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
   const atoms = useAtomsStore(s => s.atoms);
+  const openWikiReader = useUIStore(s => s.openWikiReader);
+  const openFindingReader = useUIStore(s => s.openFindingReader);
 
   const [activeCitation, setActiveCitation] = useState<ChatCitation | null>(null);
   const [anchorRect, setAnchorRect] = useState<{ top: number; left: number; bottom: number; width: number } | null>(null);
@@ -94,6 +97,25 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
       onViewAtom(atomId, highlightText);
     }
     handleClosePopover();
+  };
+
+  // Open whatever a citation points at. The excerpt doubles as the passage
+  // to scroll to, which is what turns a citation into a deep link — except
+  // for findings, whose reader has no highlight support (accepted; the
+  // finding still opens, just at the top).
+  const handleOpenCitation = (citation: ChatCitation) => {
+    switch (citation.source_type) {
+      case 'wiki':
+        openWikiReader(citation.atom_id, citation.source_title ?? 'Wiki', citation.excerpt);
+        handleClosePopover();
+        return;
+      case 'finding':
+        openFindingReader(citation.atom_id);
+        handleClosePopover();
+        return;
+      default:
+        handleViewAtom(citation.atom_id, citation.excerpt);
+    }
   };
 
   // Process text to replace [N] citations and [[atom-id]] references with
@@ -245,7 +267,7 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
     <>
       <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
         <div
-          className={`max-w-[85%] rounded-lg px-4 py-3 ${
+          className={`group max-w-[85%] rounded-lg px-4 py-3 ${
             isUser
               ? 'bg-[var(--color-accent)] text-white'
               : 'bg-[var(--color-bg-card)] text-[var(--color-text-primary)]'
@@ -302,9 +324,10 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
                   <button
                     key={citation.id}
                     onClick={(e) => handleCitationClick(citation, e.currentTarget)}
-                    className="px-2 py-0.5 text-xs rounded bg-[var(--color-bg-hover)] hover:bg-[var(--color-border-hover)] text-[var(--color-accent-light)] transition-colors cursor-pointer"
-                    title={citation.excerpt}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-[var(--color-bg-hover)] hover:bg-[var(--color-border-hover)] text-[var(--color-accent-light)] transition-colors cursor-pointer"
+                    title={citation.source_title ? `${citation.source_title} — ${citation.excerpt}` : citation.excerpt}
                   >
+                    <SourceIcon sourceType={citation.source_type} />
                     [{citation.citation_index}]
                   </button>
                 ))}
@@ -312,20 +335,82 @@ export function ChatMessage({ message, isStreaming = false, onViewAtom, searchQu
             </div>
           )}
 
+          {/* Keep the answer. Hidden until the turn is finished — there is no
+              answer to save mid-stream — and on the demo, where atoms aren't
+              the visitor's to create. */}
+          {isAssistant && !isStreaming && message.content && !isDemoInstance() && (
+            <div className="mt-2 flex justify-end opacity-0 max-md:opacity-100 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+              <SaveAnswerAction messageId={message.id} />
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Citation popover */}
+      {/* Citation popover. Where "view source" goes depends on what the
+          citation cites, so the popover's callback defers to the citation
+          rather than assuming an atom. */}
       {activeCitation && anchorRect && (
         <CitationPopover
           citation={activeCitation}
           anchorRect={anchorRect}
           onClose={handleClosePopover}
-          onViewAtom={handleViewAtom}
+          onViewAtom={() => handleOpenCitation(activeCitation)}
         />
       )}
     </>
   );
+}
+
+const ANSWER_ACTION_CLASS =
+  'inline-flex items-center gap-1.5 px-2 py-1 text-xs rounded text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors disabled:cursor-default disabled:hover:bg-transparent';
+
+// Turns an answer into an atom, then becomes the way back to it. The saved id
+// only lives for this session (see `savedAtomIdByMessageId`), so after a
+// reload the action reads as unsaved again.
+function SaveAnswerAction({ messageId }: { messageId: string }) {
+  const savedAtomId = useChatStore((s) => s.savedAtomIdByMessageId[messageId]);
+  const isSaving = useChatStore((s) => s.savingAnswerMessageIds[messageId] === true);
+  const saveAnswer = useChatStore((s) => s.saveAnswer);
+  const openReader = useUIStore((s) => s.openReader);
+
+  if (savedAtomId) {
+    return (
+      <button
+        type="button"
+        onClick={() => openReader(savedAtomId)}
+        className={ANSWER_ACTION_CLASS}
+        title="Open the atom this answer was saved as"
+      >
+        <Check className="w-3.5 h-3.5" strokeWidth={2} />
+        Saved — open
+      </button>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => void saveAnswer(messageId)}
+      disabled={isSaving}
+      className={ANSWER_ACTION_CLASS}
+      title="Save this answer as an atom, tagged Chat Answers"
+    >
+      {isSaving ? (
+        <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={2} />
+      ) : (
+        <FilePlus className="w-3.5 h-3.5" strokeWidth={2} />
+      )}
+      {isSaving ? 'Saving…' : 'Save as atom'}
+    </button>
+  );
+}
+
+// Quietly marks the sources that aren't atoms — same icons the wiki and
+// reports views use in the nav.
+function SourceIcon({ sourceType }: { sourceType?: ChatCitation['source_type'] }) {
+  if (sourceType === 'wiki') return <BookOpen className="w-3 h-3" strokeWidth={2} />;
+  if (sourceType === 'finding') return <Telescope className="w-3 h-3" strokeWidth={2} />;
+  return null;
 }
 
 function displayTitleForAtom(atom: Pick<AtomSummary, 'id' | 'title' | 'snippet'>): string {

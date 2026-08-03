@@ -2,6 +2,7 @@ use super::PostgresStorage;
 use crate::chat::truncate_preview;
 use crate::error::AtomicCoreError;
 use crate::models::*;
+use crate::search::ScopeFilter;
 use crate::storage::traits::*;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -11,9 +12,9 @@ async fn fetch_conversation_tags(
     pool: &sqlx::PgPool,
     conversation_id: &str,
     db_id: &str,
-) -> StorageResult<Vec<Tag>> {
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, bool, String)>(
-        "SELECT t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description
+) -> StorageResult<Vec<ScopeTag>> {
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, bool, String, String)>(
+        "SELECT t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description, ct.mode
          FROM tags t
          JOIN conversation_tags ct ON ct.tag_id = t.id
          WHERE ct.conversation_id = $1 AND ct.db_id = $2 AND t.db_id = $2
@@ -28,13 +29,18 @@ async fn fetch_conversation_tags(
     Ok(rows
         .into_iter()
         .map(
-            |(id, name, parent_id, created_at, is_autotag_target, autotag_description)| Tag {
-                id,
-                name,
-                parent_id,
-                created_at,
-                is_autotag_target,
-                autotag_description,
+            |(id, name, parent_id, created_at, is_autotag_target, autotag_description, mode)| {
+                ScopeTag {
+                    tag: Tag {
+                        id,
+                        name,
+                        parent_id,
+                        created_at,
+                        is_autotag_target,
+                        autotag_description,
+                    },
+                    mode: ScopeMode::from_db(&mode),
+                }
             },
         )
         .collect())
@@ -118,13 +124,25 @@ async fn batch_fetch_conversation_tags(
     pool: &sqlx::PgPool,
     conv_ids: &[String],
     db_id: &str,
-) -> StorageResult<HashMap<String, Vec<Tag>>> {
+) -> StorageResult<HashMap<String, Vec<ScopeTag>>> {
     if conv_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let rows = sqlx::query_as::<_, (String, String, String, Option<String>, String, bool, String)>(
-        "SELECT ct.conversation_id, t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            bool,
+            String,
+            String,
+        ),
+    >(
+        "SELECT ct.conversation_id, t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description, ct.mode
          FROM conversation_tags ct
          JOIN tags t ON ct.tag_id = t.id
          WHERE ct.conversation_id = ANY($1) AND ct.db_id = $2 AND t.db_id = $2
@@ -136,15 +154,20 @@ async fn batch_fetch_conversation_tags(
     .await
     .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
-    let mut map: HashMap<String, Vec<Tag>> = HashMap::new();
-    for (conv_id, id, name, parent_id, created_at, is_autotag_target, autotag_description) in rows {
-        map.entry(conv_id).or_default().push(Tag {
-            id,
-            name,
-            parent_id,
-            created_at,
-            is_autotag_target,
-            autotag_description,
+    let mut map: HashMap<String, Vec<ScopeTag>> = HashMap::new();
+    for (conv_id, id, name, parent_id, created_at, is_autotag_target, autotag_description, mode) in
+        rows
+    {
+        map.entry(conv_id).or_default().push(ScopeTag {
+            tag: Tag {
+                id,
+                name,
+                parent_id,
+                created_at,
+                is_autotag_target,
+                autotag_description,
+            },
+            mode: ScopeMode::from_db(&mode),
         });
     }
 
@@ -264,13 +287,15 @@ impl ChatStore for PostgresStorage {
         filter_tag_id: Option<&str>,
         limit: i32,
         offset: i32,
+        include_archived: bool,
     ) -> StorageResult<Vec<ConversationWithTags>> {
+        let max_archived = i32::from(include_archived);
         let conversations: Vec<Conversation> = if let Some(tag_id) = filter_tag_id {
             let rows = sqlx::query_as::<_, (String, Option<String>, String, String, i32)>(
                 "SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at, c.is_archived
                  FROM conversations c
                  JOIN conversation_tags ct ON ct.conversation_id = c.id
-                 WHERE ct.tag_id = $1 AND c.is_archived = 0 AND c.db_id = $4 AND ct.db_id = $4
+                 WHERE ct.tag_id = $1 AND c.is_archived <= $5 AND c.db_id = $4 AND ct.db_id = $4
                  ORDER BY c.updated_at DESC
                  LIMIT $2 OFFSET $3",
             )
@@ -278,6 +303,7 @@ impl ChatStore for PostgresStorage {
             .bind(limit)
             .bind(offset)
             .bind(&self.db_id)
+            .bind(max_archived)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
@@ -297,13 +323,14 @@ impl ChatStore for PostgresStorage {
             let rows = sqlx::query_as::<_, (String, Option<String>, String, String, i32)>(
                 "SELECT id, title, created_at, updated_at, is_archived
                  FROM conversations
-                 WHERE is_archived = 0 AND db_id = $3
+                 WHERE is_archived <= $4 AND db_id = $3
                  ORDER BY updated_at DESC
                  LIMIT $1 OFFSET $2",
             )
             .bind(limit)
             .bind(offset)
             .bind(&self.db_id)
+            .bind(max_archived)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
@@ -453,33 +480,60 @@ impl ChatStore for PostgresStorage {
             tool_calls_map.entry(message_id).or_default().push(tc);
         }
 
-        // Batch fetch citations
-        let cit_rows =
-            sqlx::query_as::<_, (String, String, String, Option<i32>, String, Option<f32>)>(
-                "SELECT id, message_id, atom_id, chunk_index, excerpt, relevance_score
-             FROM chat_citations
-             WHERE message_id = ANY($1) AND db_id = $2",
-            )
-            .bind(&msg_ids)
-            .bind(&self.db_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        // Batch fetch citations. The wiki citation's tag name is joined
+        // rather than stored, so a renamed tag reads back under its
+        // current name.
+        let cit_rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                i32,
+                String,
+                Option<i32>,
+                String,
+                Option<f32>,
+                String,
+                Option<String>,
+            ),
+        >(
+            "SELECT c.id, c.message_id, c.citation_index, c.atom_id, c.chunk_index,
+                    c.excerpt, c.relevance_score, c.source_type, t.name
+             FROM chat_citations c
+             LEFT JOIN tags t
+                    ON t.id = c.atom_id AND t.db_id = c.db_id AND c.source_type = 'wiki'
+             WHERE c.message_id = ANY($1) AND c.db_id = $2
+             ORDER BY c.citation_index",
+        )
+        .bind(&msg_ids)
+        .bind(&self.db_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         let mut citations_map: HashMap<String, Vec<ChatCitation>> = HashMap::new();
-        // The Postgres schema lacks citation_index; we assign based on order.
-        let mut per_message_idx: HashMap<String, i32> = HashMap::new();
-        for (id, message_id, atom_id, chunk_index, excerpt, relevance_score) in cit_rows {
-            let idx = per_message_idx.entry(message_id.clone()).or_insert(0);
-            *idx += 1;
+        for (
+            id,
+            message_id,
+            citation_index,
+            atom_id,
+            chunk_index,
+            excerpt,
+            relevance_score,
+            source_type,
+            source_title,
+        ) in cit_rows
+        {
             let cit = ChatCitation {
                 id,
                 message_id: message_id.clone(),
-                citation_index: *idx,
+                citation_index,
                 atom_id,
                 chunk_index,
                 excerpt,
                 relevance_score,
+                source_type,
+                source_title,
             };
             citations_map.entry(message_id).or_default().push(cit);
         }
@@ -558,6 +612,26 @@ impl ChatStore for PostgresStorage {
         })
     }
 
+    async fn set_conversation_title_if_unset(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> StorageResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversations SET title = $1, updated_at = $2
+             WHERE id = $3 AND db_id = $4 AND title IS NULL",
+        )
+        .bind(title)
+        .bind(&now)
+        .bind(id)
+        .bind(&self.db_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete_conversation(&self, id: &str) -> StorageResult<()> {
         sqlx::query("DELETE FROM conversations WHERE id = $1 AND db_id = $2")
             .bind(id)
@@ -571,7 +645,7 @@ impl ChatStore for PostgresStorage {
     async fn set_conversation_scope(
         &self,
         conversation_id: &str,
-        tag_ids: &[String],
+        entries: &[ScopeEntry],
     ) -> StorageResult<ConversationWithTags> {
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -582,12 +656,13 @@ impl ChatStore for PostgresStorage {
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
-        for tag_id in tag_ids {
+        for entry in entries {
             sqlx::query(
-                "INSERT INTO conversation_tags (conversation_id, tag_id, db_id) VALUES ($1, $2, $3)",
+                "INSERT INTO conversation_tags (conversation_id, tag_id, mode, db_id) VALUES ($1, $2, $3, $4)",
             )
             .bind(conversation_id)
-            .bind(tag_id)
+            .bind(&entry.tag_id)
+            .bind(entry.mode.as_str())
             .bind(&self.db_id)
             .execute(&self.pool)
             .await
@@ -609,15 +684,17 @@ impl ChatStore for PostgresStorage {
         &self,
         conversation_id: &str,
         tag_id: &str,
+        mode: ScopeMode,
     ) -> StorageResult<ConversationWithTags> {
         let now = chrono::Utc::now().to_rfc3339();
 
         sqlx::query(
-            "INSERT INTO conversation_tags (conversation_id, tag_id, db_id) VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING",
+            "INSERT INTO conversation_tags (conversation_id, tag_id, mode, db_id) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (conversation_id, tag_id) DO UPDATE SET mode = EXCLUDED.mode",
         )
         .bind(conversation_id)
         .bind(tag_id)
+        .bind(mode.as_str())
         .bind(&self.db_id)
         .execute(&self.pool)
         .await
@@ -752,15 +829,17 @@ impl ChatStore for PostgresStorage {
     ) -> StorageResult<()> {
         for citation in citations {
             sqlx::query(
-                "INSERT INTO chat_citations (id, message_id, atom_id, chunk_index, excerpt, relevance_score, db_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                "INSERT INTO chat_citations (id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score, source_type, db_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(&citation.id)
             .bind(message_id)
+            .bind(citation.citation_index)
             .bind(&citation.atom_id)
             .bind(citation.chunk_index)
             .bind(&citation.excerpt)
             .bind(citation.relevance_score)
+            .bind(&citation.source_type)
             .bind(&self.db_id)
             .execute(&self.pool)
             .await
@@ -769,9 +848,9 @@ impl ChatStore for PostgresStorage {
         Ok(())
     }
 
-    async fn get_scope_tag_ids(&self, conversation_id: &str) -> StorageResult<Vec<String>> {
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT tag_id FROM conversation_tags WHERE conversation_id = $1 AND db_id = $2",
+    async fn get_conversation_scope(&self, conversation_id: &str) -> StorageResult<ScopeFilter> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT tag_id, mode FROM conversation_tags WHERE conversation_id = $1 AND db_id = $2",
         )
         .bind(conversation_id)
         .bind(&self.db_id)
@@ -779,30 +858,32 @@ impl ChatStore for PostgresStorage {
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
-        Ok(rows)
+        let mut scope = ScopeFilter::default();
+        for (tag_id, mode) in rows {
+            scope.push(tag_id, ScopeMode::from_db(&mode));
+        }
+        Ok(scope)
     }
 
-    async fn get_scope_description(&self, tag_ids: &[String]) -> StorageResult<String> {
-        if tag_ids.is_empty() {
-            return Ok("You have access to ALL atoms in the knowledge base.".to_string());
+    async fn get_scope_description(&self, scope: &ScopeFilter) -> StorageResult<String> {
+        let roots = scope.roots();
+        if roots.is_empty() {
+            return Ok(crate::chat::describe_scope(scope, &HashMap::new()));
         }
 
-        let names = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM tags WHERE id = ANY($1) AND db_id = $2",
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, name FROM tags WHERE id = ANY($1) AND db_id = $2",
         )
-        .bind(tag_ids)
+        .bind(&roots)
         .bind(&self.db_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
-        if names.is_empty() {
-            Ok("You have access to a scoped set of atoms.".to_string())
-        } else {
-            Ok(format!(
-                "You have access to atoms tagged with: {}. Focus your search on these topics.",
-                names.join(", ")
-            ))
-        }
+        // Names are a nicety; the scope itself is not. Tags that don't
+        // resolve still shape the paragraph, because retrieval applies the
+        // filter whether or not the prompt could name it.
+        let names: HashMap<String, String> = rows.into_iter().collect();
+        Ok(crate::chat::describe_scope(scope, &names))
     }
 }

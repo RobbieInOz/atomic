@@ -847,8 +847,11 @@ export function SigmaCanvas({
     sigmaRef.current?.refresh();
   }, [selectedTagId]);
 
-  // Continuously refresh sigma during chat sidebar transition so the graph resizes smoothly
+  // Continuously refresh sigma during chat sidebar transition so the graph
+  // resizes smoothly. Expanding the pane collapses this column to zero width
+  // without unmounting it, so the same catch-up applies.
   const chatSidebarOpen = useUIStore(s => s.chatSidebarOpen);
+  const chatSidebarExpanded = useUIStore(s => s.chatSidebarExpanded);
   useEffect(() => {
     const start = performance.now();
     let raf: number;
@@ -860,7 +863,7 @@ export function SigmaCanvas({
     }
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [chatSidebarOpen]);
+  }, [chatSidebarOpen, chatSidebarExpanded]);
 
   // Subscribe to canvas action events from the chat agent.
   // Preview instances don't own the controller and shouldn't react to chat actions.

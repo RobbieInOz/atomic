@@ -147,8 +147,8 @@ const initialState: OnboardingState = {
   apiKey: '',
   embeddingModel: 'openai/text-embedding-3-small',
   taggingModel: 'openai/gpt-4o-mini',
-  wikiModel: 'anthropic/claude-sonnet-4.6',
-  chatModel: 'anthropic/claude-sonnet-4.6',
+  wikiModel: 'anthropic/claude-sonnet-5',
+  chatModel: 'anthropic/claude-sonnet-5',
   autoTaggingEnabled: true,
   isTesting: false,
   testResult: null,
@@ -211,8 +211,8 @@ function reducer(state: OnboardingState, action: OnboardingAction): OnboardingSt
       } else if (action.value === 'openrouter') {
         base.embeddingModel = 'openai/text-embedding-3-small';
         base.taggingModel = 'openai/gpt-4o-mini';
-        base.wikiModel = 'anthropic/claude-sonnet-4.6';
-        base.chatModel = 'anthropic/claude-sonnet-4.6';
+        base.wikiModel = 'anthropic/claude-sonnet-5';
+        base.chatModel = 'anthropic/claude-sonnet-5';
       }
       return base;
     }

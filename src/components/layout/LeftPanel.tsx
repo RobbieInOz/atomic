@@ -4,6 +4,7 @@ import { TocPanel } from '../toc/TocPanel';
 import { WikiArticlesList } from '../wiki/WikiArticlesList';
 import { RecentAtomsPanel } from '../dashboard/RecentAtomsPanel';
 import { LatestFindingsPanel } from '../reports/LatestFindingsPanel';
+import { ConversationsSidebar } from '../chat/ConversationsSidebar';
 import { useUIStore } from '../../stores/ui';
 import { useTocStore, type TocSource } from '../../stores/toc';
 import { isTauri } from '../../lib/platform';
@@ -59,6 +60,8 @@ function SidebarBody({ context }: { context: SidebarContext }) {
       return <RecentAtomsPanel />;
     case 'findings':
       return <LatestFindingsPanel reportId={context.reportId} />;
+    case 'conversations':
+      return <ConversationsSidebar />;
   }
 }
 
@@ -123,7 +126,12 @@ export function LeftPanel() {
         <div
           className="h-full w-[250px] bg-[var(--color-bg-panel)]/80 border-r border-[var(--color-border)] backdrop-blur-xl flex flex-col overflow-hidden md:absolute md:inset-y-0 md:left-0 md:translate-x-0 md:pointer-events-auto"
         >
-          {/* Titlebar row — names whatever the body is currently showing */}
+          {/* Titlebar row — names whatever the body is currently showing.
+              While the panel is open this is the leftmost visible surface, so
+              it, and only it, holds the Tauri traffic lights clear; the panel
+              collapses to zero width when closed, at which point the clearance
+              passes to MainView's titlebar (or, with chat expanded to
+              fullscreen and that bar collapsed too, ChatViewer's header). */}
           <div className={`h-[52px] flex items-center px-3 flex-shrink-0 gap-1 ${isTauri() ? 'pl-[78px]' : ''}`} data-tauri-drag-region>
             <span className="text-xs font-semibold text-[var(--color-text-tertiary)] uppercase tracking-wider truncate select-none">
               {SIDEBAR_CONTEXT_TITLES[context.kind]}

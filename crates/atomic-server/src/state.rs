@@ -89,6 +89,96 @@ impl SetupClaimLimiter {
     }
 }
 
+/// Cancellation flags for chat turns currently running in this process.
+///
+/// A turn registers when `POST /conversations/{id}/messages` starts and
+/// deregisters when the handler returns (the [`ChatTurn`] guard covers every
+/// exit, including early errors and client disconnects). `POST
+/// .../messages/cancel` raises the flag; `atomic-core`'s agent loop notices at
+/// its next checkpoint and finalizes the partial answer.
+///
+/// Entries are keyed by `(scope, conversation_id)` — the scope being the
+/// composing layer's [`crate::db_extractor::RequestJobScope`], as with the job
+/// registries — so a multi-tenant composition can't cancel another tenant's
+/// turn by guessing a conversation id. The standalone server has no scope and
+/// keys on `None`.
+#[derive(Default)]
+pub struct ChatCancellations {
+    turns: Mutex<HashMap<(Option<String>, String), atomic_core::ChatCancel>>,
+}
+
+impl ChatCancellations {
+    /// Register a starting turn. Dropping the returned guard deregisters it.
+    pub fn begin(&self, scope: Option<String>, conversation_id: &str) -> ChatTurn<'_> {
+        let key = (scope, conversation_id.to_string());
+        let flag = atomic_core::ChatCancel::default();
+        if let Ok(mut turns) = self.turns.lock() {
+            // A second turn on the same conversation (double-send, or a retry
+            // racing its predecessor) supersedes the first. Superseding means
+            // stopping it: the displaced turn is now unreachable — no cancel
+            // can find its flag once this one takes the key — so raise it here
+            // or it streams to completion into a conversation whose next
+            // answer is already being written. The older guard's pointer check
+            // keeps it from removing this entry when it finally drops.
+            if let Some(displaced) = turns.insert(key.clone(), Arc::clone(&flag)) {
+                displaced.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        ChatTurn {
+            registry: self,
+            key,
+            flag,
+        }
+    }
+
+    /// Raise the flag for a running turn. `false` when nothing was running,
+    /// which callers treat as success — cancelling is idempotent.
+    pub fn cancel(&self, scope: Option<&str>, conversation_id: &str) -> bool {
+        let key = (scope.map(str::to_string), conversation_id.to_string());
+        let Ok(turns) = self.turns.lock() else {
+            return false;
+        };
+        match turns.get(&key) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn end(&self, key: &(Option<String>, String), flag: &atomic_core::ChatCancel) {
+        if let Ok(mut turns) = self.turns.lock() {
+            if turns
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, flag))
+            {
+                turns.remove(key);
+            }
+        }
+    }
+}
+
+/// RAII registration of one in-flight chat turn. See [`ChatCancellations`].
+pub struct ChatTurn<'a> {
+    registry: &'a ChatCancellations,
+    key: (Option<String>, String),
+    flag: atomic_core::ChatCancel,
+}
+
+impl ChatTurn<'_> {
+    /// The flag to hand to `atomic-core`'s agent loop.
+    pub fn flag(&self) -> atomic_core::ChatCancel {
+        Arc::clone(&self.flag)
+    }
+}
+
+impl Drop for ChatTurn<'_> {
+    fn drop(&mut self) {
+        self.registry.end(&self.key, &self.flag);
+    }
+}
+
 /// Shared application state for all route handlers
 pub struct AppState {
     pub manager: Arc<DatabaseManager>,
@@ -109,6 +199,8 @@ pub struct AppState {
     pub setup_claim_lock: AsyncMutex<()>,
     /// Rate-limits setup claim attempts by client IP.
     pub setup_claim_limiter: SetupClaimLimiter,
+    /// Cancellation flags for chat turns running in this process.
+    pub chat_cancellations: ChatCancellations,
 }
 
 impl AppState {
@@ -269,6 +361,7 @@ pub enum ServerEvent {
         conversation_id: String,
         tool_call_id: String,
         results_count: i32,
+        failed: bool,
     },
     ChatComplete {
         conversation_id: String,
@@ -282,6 +375,10 @@ pub enum ServerEvent {
     ChatError {
         conversation_id: String,
         error: String,
+    },
+    ChatConversationUpdated {
+        conversation_id: String,
+        title: String,
     },
 }
 
@@ -456,10 +553,12 @@ impl From<atomic_core::ChatEvent> for ServerEvent {
                 conversation_id,
                 tool_call_id,
                 results_count,
+                failed,
             } => ServerEvent::ChatToolComplete {
                 conversation_id,
                 tool_call_id,
                 results_count,
+                failed,
             },
             atomic_core::ChatEvent::Complete {
                 conversation_id,
@@ -489,6 +588,13 @@ impl From<atomic_core::ChatEvent> for ServerEvent {
                 conversation_id: _,
                 event,
             } => ServerEvent::from(event),
+            atomic_core::ChatEvent::ConversationUpdated {
+                conversation_id,
+                title,
+            } => ServerEvent::ChatConversationUpdated {
+                conversation_id,
+                title,
+            },
             atomic_core::ChatEvent::Error {
                 conversation_id,
                 error,

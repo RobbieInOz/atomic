@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { useUIStore, type Tab, type TabEntry } from '../stores/ui';
+import { LEAVE_FULLSCREEN_CHAT, useUIStore, type Tab, type TabEntry } from '../stores/ui';
 import { parseLocation, type ParsedRoute } from './routes';
 import { setNavigateFn, type NavigateState } from './navigate-ref';
 
@@ -14,7 +14,9 @@ import { setNavigateFn, type NavigateState } from './navigate-ref';
 ///      tabs array is the source of truth for what tabs exist and where in
 ///      their stacks the user has been. Bridge keeps the two consistent:
 ///      activate/create tabs to match URL, navigate to the current tab's
-///      entry on tab switches.
+///      entry on tab switches. Every reconcile also leaves fullscreen chat —
+///      the store's navigating actions do, and browser Back/Forward reaches
+///      here instead of through them, so the promise has to be kept twice.
 ///
 /// The seq counter in `history.state` is still used to disambiguate forward
 /// vs back popstate. Without it, browser-back to a tab whose stackIndex was
@@ -240,6 +242,7 @@ export function RouterBridge() {
       const projected = projectActiveEntry(null);
       const needsUpdate =
         store.activeTabId !== null ||
+        store.chatSidebarExpanded ||
         store.viewMode !== parsed.viewMode ||
         store.selectedTagId !== parsed.tagId ||
         store.readerState.atomId !== null ||
@@ -252,6 +255,7 @@ export function RouterBridge() {
         viewMode: parsed.viewMode,
         selectedTagId: parsed.tagId,
         activeTabId: null,
+        ...LEAVE_FULLSCREEN_CHAT,
         ...projected,
         localGraph: { ...s.localGraph, ...projected.localGraphPatch },
       }));
@@ -266,6 +270,7 @@ export function RouterBridge() {
       useUIStore.setState((s) => ({
         tabs: reconciled.tabs,
         activeTabId: reconciled.activeTabId,
+        ...LEAVE_FULLSCREEN_CHAT,
         selectedTagId:
           parsed.kind === 'wiki-reader' ||
           parsed.kind === 'reports-detail' ||
@@ -295,6 +300,7 @@ export function RouterBridge() {
       tabs: [...s.tabs, newTab],
       activeTabId: tabId,
       nextTabOrdinal: s.nextTabOrdinal + 1,
+      ...LEAVE_FULLSCREEN_CHAT,
       selectedTagId:
         parsed.kind === 'wiki-reader' ||
         parsed.kind === 'reports-detail' ||

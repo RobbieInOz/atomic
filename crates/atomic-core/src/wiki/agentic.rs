@@ -131,7 +131,7 @@ async fn handle_search(
     rc: &mut ResearchContext,
     storage: &StorageBackend,
     provider_config: &crate::providers::ProviderConfig,
-    scope_tag_ids: &[String],
+    scope: &crate::search::ScopeFilter,
     args: &serde_json::Value,
 ) -> String {
     let query = args
@@ -158,7 +158,7 @@ async fn handle_search(
 
     // Perform hybrid search: keyword + vector, merged via RRF
     let keyword_results = match storage
-        .keyword_search_chunks_sync(&query, limit * 2, scope_tag_ids, None, &kinds)
+        .keyword_search_chunks_sync(&query, limit * 2, scope, None, &kinds)
         .await
     {
         Ok(r) => r,
@@ -176,7 +176,7 @@ async fn handle_search(
                             &embeddings[0],
                             limit * 2,
                             0.3,
-                            scope_tag_ids,
+                            scope,
                             None,
                             &kinds,
                         )
@@ -333,7 +333,7 @@ fn handle_done(rc: &ResearchContext) -> String {
 async fn run_research(
     rc: &mut ResearchContext,
     storage: &StorageBackend,
-    scope_tag_ids: &[String],
+    scope: &crate::search::ScopeFilter,
     provider_config: &crate::providers::ProviderConfig,
     model: &str,
     max_source_tokens: usize,
@@ -398,7 +398,7 @@ async fn run_research(
                 .unwrap_or(serde_json::json!({}));
 
             let result = match name {
-                "search" => handle_search(rc, storage, provider_config, scope_tag_ids, &args).await,
+                "search" => handle_search(rc, storage, provider_config, scope, &args).await,
                 "select" => handle_select(rc, &args, max_source_tokens),
                 "done" => {
                     research_done = true;
@@ -528,7 +528,7 @@ pub(crate) async fn generate(
     run_research(
         &mut rc,
         &ctx.storage,
-        &scope_tag_ids,
+        &crate::search::ScopeFilter::including(scope_tag_ids.clone()),
         &ctx.provider_config,
         &ctx.wiki_model,
         max_tokens,
@@ -613,7 +613,7 @@ pub(crate) async fn research_for_update(
     run_research(
         &mut rc,
         &ctx.storage,
-        &scope_tag_ids,
+        &crate::search::ScopeFilter::including(scope_tag_ids.clone()),
         &ctx.provider_config,
         &ctx.wiki_model,
         max_tokens,

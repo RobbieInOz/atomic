@@ -30,6 +30,8 @@ export function normalizeServerEvent(data: Record<string, unknown>): NormalizedE
       return { event: 'chat-canvas-action', payload: data };
     case 'ChatError':
       return { event: 'chat-error', payload: data };
+    case 'ChatConversationUpdated':
+      return { event: 'chat-conversation-updated', payload: data };
     case 'AtomCreated':
       return { event: 'atom-created', payload: data.atom };
     case 'AtomUpdated':

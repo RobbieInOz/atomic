@@ -6,8 +6,9 @@
 use crate::error::AtomicCoreError;
 use crate::models::{
     ChatCitation, ChatMessage, ChatMessageWithContext, ChatToolCall, Conversation,
-    ConversationWithMessages, ConversationWithTags, Tag,
+    ConversationWithMessages, ConversationWithTags, ScopeEntry, ScopeMode, ScopeTag, Tag,
 };
+use crate::search::ScopeFilter;
 use rusqlite::Connection;
 
 // ==================== Helper Functions ====================
@@ -26,13 +27,13 @@ pub(crate) fn truncate_preview(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Get tags for a conversation
+/// Get the scope tags for a conversation, each with the mode it plays.
 pub fn get_conversation_tags(
     conn: &Connection,
     conversation_id: &str,
-) -> Result<Vec<Tag>, AtomicCoreError> {
+) -> Result<Vec<ScopeTag>, AtomicCoreError> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description
+        "SELECT t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description, ct.mode
          FROM tags t
          JOIN conversation_tags ct ON ct.tag_id = t.id
          WHERE ct.conversation_id = ?1
@@ -41,13 +42,16 @@ pub fn get_conversation_tags(
 
     let tags = stmt
         .query_map([conversation_id], |row| {
-            Ok(Tag {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                parent_id: row.get(2)?,
-                created_at: row.get(3)?,
-                is_autotag_target: row.get::<_, i32>(4)? != 0,
-                autotag_description: row.get(5)?,
+            Ok(ScopeTag {
+                tag: Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    parent_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    is_autotag_target: row.get::<_, i32>(4)? != 0,
+                    autotag_description: row.get(5)?,
+                },
+                mode: ScopeMode::from_db(&row.get::<_, String>(6)?),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -123,28 +127,39 @@ pub fn get_message_citations(
     conn: &Connection,
     message_id: &str,
 ) -> Result<Vec<ChatCitation>, AtomicCoreError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score
-         FROM chat_citations
-         WHERE message_id = ?1
-         ORDER BY citation_index",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{CITATION_SELECT}
+         WHERE c.message_id = ?1
+         ORDER BY c.citation_index"
+    ))?;
 
     let citations = stmt
-        .query_map([message_id], |row| {
-            Ok(ChatCitation {
-                id: row.get(0)?,
-                message_id: row.get(1)?,
-                citation_index: row.get(2)?,
-                atom_id: row.get(3)?,
-                chunk_index: row.get(4)?,
-                excerpt: row.get(5)?,
-                relevance_score: row.get(6)?,
-            })
-        })?
+        .query_map([message_id], citation_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(citations)
+}
+
+/// Every citation column plus the wiki citation's tag name, which is joined
+/// rather than stored so a renamed tag reads back under its current name.
+const CITATION_SELECT: &str =
+    "SELECT c.id, c.message_id, c.citation_index, c.atom_id, c.chunk_index,
+                c.excerpt, c.relevance_score, c.source_type, t.name
+         FROM chat_citations c
+         LEFT JOIN tags t ON t.id = c.atom_id AND c.source_type = 'wiki'";
+
+fn citation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatCitation> {
+    Ok(ChatCitation {
+        id: row.get(0)?,
+        message_id: row.get(1)?,
+        citation_index: row.get(2)?,
+        atom_id: row.get(3)?,
+        chunk_index: row.get(4)?,
+        excerpt: row.get(5)?,
+        relevance_score: row.get(6)?,
+        source_type: row.get(7)?,
+        source_title: row.get(8)?,
+    })
 }
 
 /// Get messages with context for a conversation
@@ -256,26 +271,18 @@ fn batch_fetch_citations(
         .collect::<Vec<_>>()
         .join(",");
     let query = format!(
-        "SELECT id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score
-         FROM chat_citations
-         WHERE message_id IN ({})
-         ORDER BY citation_index",
+        "{CITATION_SELECT}
+         WHERE c.message_id IN ({})
+         ORDER BY c.citation_index",
         placeholders
     );
     let mut stmt = conn.prepare(&query)?;
     let mut map: std::collections::HashMap<String, Vec<ChatCitation>> =
         std::collections::HashMap::new();
-    let rows = stmt.query_map(rusqlite::params_from_iter(message_ids.iter()), |row| {
-        Ok(ChatCitation {
-            id: row.get(0)?,
-            message_id: row.get(1)?,
-            citation_index: row.get(2)?,
-            atom_id: row.get(3)?,
-            chunk_index: row.get(4)?,
-            excerpt: row.get(5)?,
-            relevance_score: row.get(6)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(message_ids.iter()),
+        citation_from_row,
+    )?;
     for row in rows {
         let c = row?;
         map.entry(c.message_id.clone()).or_default().push(c);
@@ -287,13 +294,13 @@ fn batch_fetch_citations(
 fn batch_fetch_conversation_tags(
     conn: &Connection,
     conv_ids: &[String],
-) -> Result<std::collections::HashMap<String, Vec<Tag>>, AtomicCoreError> {
+) -> Result<std::collections::HashMap<String, Vec<ScopeTag>>, AtomicCoreError> {
     if conv_ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
     let placeholders = conv_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
-        "SELECT ct.conversation_id, t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description
+        "SELECT ct.conversation_id, t.id, t.name, t.parent_id, t.created_at, t.is_autotag_target, t.autotag_description, ct.mode
          FROM conversation_tags ct
          JOIN tags t ON ct.tag_id = t.id
          WHERE ct.conversation_id IN ({})
@@ -301,17 +308,21 @@ fn batch_fetch_conversation_tags(
         placeholders
     );
     let mut stmt = conn.prepare(&query)?;
-    let mut map: std::collections::HashMap<String, Vec<Tag>> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, Vec<ScopeTag>> =
+        std::collections::HashMap::new();
     let rows = stmt.query_map(rusqlite::params_from_iter(conv_ids.iter()), |row| {
         Ok((
             row.get::<_, String>(0)?,
-            Tag {
-                id: row.get(1)?,
-                name: row.get(2)?,
-                parent_id: row.get(3)?,
-                created_at: row.get(4)?,
-                is_autotag_target: row.get::<_, i32>(5)? != 0,
-                autotag_description: row.get(6)?,
+            ScopeTag {
+                tag: Tag {
+                    id: row.get(1)?,
+                    name: row.get(2)?,
+                    parent_id: row.get(3)?,
+                    created_at: row.get(4)?,
+                    is_autotag_target: row.get::<_, i32>(5)? != 0,
+                    autotag_description: row.get(6)?,
+                },
+                mode: ScopeMode::from_db(&row.get::<_, String>(7)?),
             },
         ))
     })?;
@@ -417,46 +428,53 @@ pub fn create_conversation(
     })
 }
 
-/// Get all conversations, optionally filtered by tag
+/// Get all conversations, optionally filtered by tag. Archived conversations
+/// are hidden unless `include_archived` — the comparison against
+/// `max_archived` keeps both cases on one query shape.
 pub fn get_conversations(
     conn: &Connection,
     filter_tag_id: Option<&str>,
     limit: i32,
     offset: i32,
+    include_archived: bool,
 ) -> Result<Vec<ConversationWithTags>, AtomicCoreError> {
+    let max_archived = i32::from(include_archived);
     let conversations: Vec<Conversation> = if let Some(tag_id) = filter_tag_id {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at, c.is_archived
              FROM conversations c
              JOIN conversation_tags ct ON ct.conversation_id = c.id
-             WHERE ct.tag_id = ?1 AND c.is_archived = 0
+             WHERE ct.tag_id = ?1 AND c.is_archived <= ?4
              ORDER BY c.updated_at DESC
              LIMIT ?2 OFFSET ?3",
         )?;
 
         let results = stmt
-            .query_map(rusqlite::params![tag_id, limit, offset], |row| {
-                Ok(Conversation {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    is_archived: row.get::<_, i32>(4)? != 0,
-                })
-            })?
+            .query_map(
+                rusqlite::params![tag_id, limit, offset, max_archived],
+                |row| {
+                    Ok(Conversation {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        is_archived: row.get::<_, i32>(4)? != 0,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         results
     } else {
         let mut stmt = conn.prepare(
             "SELECT id, title, created_at, updated_at, is_archived
              FROM conversations
-             WHERE is_archived = 0
+             WHERE is_archived <= ?3
              ORDER BY updated_at DESC
              LIMIT ?1 OFFSET ?2",
         )?;
 
         let results = stmt
-            .query_map(rusqlite::params![limit, offset], |row| {
+            .query_map(rusqlite::params![limit, offset, max_archived], |row| {
                 Ok(Conversation {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -580,6 +598,26 @@ pub fn update_conversation(
     .map_err(|_| AtomicCoreError::NotFound(format!("Conversation not found: {}", id)))
 }
 
+/// Name an untitled conversation, and say whether the name landed.
+///
+/// The auto-titler reads, decides, calls a model, and only then writes — long
+/// enough for the user to have typed their own title in between. `AND title
+/// IS NULL` makes the check and the write one statement, so a rename can
+/// never be overwritten by a generation that started before it. `false` means
+/// the conversation was already named and nothing changed.
+pub fn set_title_if_unset(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+) -> Result<bool, AtomicCoreError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title IS NULL",
+        rusqlite::params![title, &now, id],
+    )?;
+    Ok(updated > 0)
+}
+
 /// Delete a conversation
 pub fn delete_conversation(conn: &Connection, id: &str) -> Result<(), AtomicCoreError> {
     conn.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
@@ -588,26 +626,13 @@ pub fn delete_conversation(conn: &Connection, id: &str) -> Result<(), AtomicCore
 
 // ==================== Scope Management ====================
 
-/// Set the full scope (replace all tags)
-pub fn set_conversation_scope(
+/// Touch the conversation's `updated_at` and read it back with its scope —
+/// the tail every scope mutation shares.
+fn reload_after_scope_change(
     conn: &Connection,
     conversation_id: &str,
-    tag_ids: &[String],
 ) -> Result<ConversationWithTags, AtomicCoreError> {
     let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "DELETE FROM conversation_tags WHERE conversation_id = ?1",
-        [conversation_id],
-    )?;
-
-    for tag_id in tag_ids {
-        conn.execute(
-            "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (?1, ?2)",
-            rusqlite::params![conversation_id, tag_id],
-        )?;
-    }
-
     conn.execute(
         "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
         rusqlite::params![&now, conversation_id],
@@ -643,52 +668,43 @@ pub fn set_conversation_scope(
     })
 }
 
-/// Add a single tag to scope
+/// Set the full scope (replace all tags)
+pub fn set_conversation_scope(
+    conn: &Connection,
+    conversation_id: &str,
+    entries: &[ScopeEntry],
+) -> Result<ConversationWithTags, AtomicCoreError> {
+    conn.execute(
+        "DELETE FROM conversation_tags WHERE conversation_id = ?1",
+        [conversation_id],
+    )?;
+
+    for entry in entries {
+        conn.execute(
+            "INSERT INTO conversation_tags (conversation_id, tag_id, mode) VALUES (?1, ?2, ?3)",
+            rusqlite::params![conversation_id, &entry.tag_id, entry.mode.as_str()],
+        )?;
+    }
+
+    reload_after_scope_change(conn, conversation_id)
+}
+
+/// Put a tag in the scope under `mode`. A tag already in scope changes mode
+/// rather than erroring — cycling a chip's mode is the same operation as
+/// adding it.
 pub fn add_tag_to_scope(
     conn: &Connection,
     conversation_id: &str,
     tag_id: &str,
+    mode: ScopeMode,
 ) -> Result<ConversationWithTags, AtomicCoreError> {
-    let now = chrono::Utc::now().to_rfc3339();
-
     conn.execute(
-        "INSERT OR IGNORE INTO conversation_tags (conversation_id, tag_id) VALUES (?1, ?2)",
-        rusqlite::params![conversation_id, tag_id],
+        "INSERT INTO conversation_tags (conversation_id, tag_id, mode) VALUES (?1, ?2, ?3)
+         ON CONFLICT(conversation_id, tag_id) DO UPDATE SET mode = excluded.mode",
+        rusqlite::params![conversation_id, tag_id, mode.as_str()],
     )?;
 
-    conn.execute(
-        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
-        rusqlite::params![&now, conversation_id],
-    )?;
-
-    let conversation = conn
-        .query_row(
-            "SELECT id, title, created_at, updated_at, is_archived
-             FROM conversations WHERE id = ?1",
-            [conversation_id],
-            |row| {
-                Ok(Conversation {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    is_archived: row.get::<_, i32>(4)? != 0,
-                })
-            },
-        )
-        .map_err(|_| {
-            AtomicCoreError::NotFound(format!("Conversation not found: {}", conversation_id))
-        })?;
-
-    let tags = get_conversation_tags(conn, conversation_id)?;
-    let (message_count, last_message_preview) = get_conversation_summary(conn, conversation_id)?;
-
-    Ok(ConversationWithTags {
-        conversation,
-        tags,
-        message_count,
-        last_message_preview,
-    })
+    reload_after_scope_change(conn, conversation_id)
 }
 
 /// Remove a single tag from scope
@@ -697,46 +713,12 @@ pub fn remove_tag_from_scope(
     conversation_id: &str,
     tag_id: &str,
 ) -> Result<ConversationWithTags, AtomicCoreError> {
-    let now = chrono::Utc::now().to_rfc3339();
-
     conn.execute(
         "DELETE FROM conversation_tags WHERE conversation_id = ?1 AND tag_id = ?2",
         rusqlite::params![conversation_id, tag_id],
     )?;
 
-    conn.execute(
-        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
-        rusqlite::params![&now, conversation_id],
-    )?;
-
-    let conversation = conn
-        .query_row(
-            "SELECT id, title, created_at, updated_at, is_archived
-             FROM conversations WHERE id = ?1",
-            [conversation_id],
-            |row| {
-                Ok(Conversation {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    is_archived: row.get::<_, i32>(4)? != 0,
-                })
-            },
-        )
-        .map_err(|_| {
-            AtomicCoreError::NotFound(format!("Conversation not found: {}", conversation_id))
-        })?;
-
-    let tags = get_conversation_tags(conn, conversation_id)?;
-    let (message_count, last_message_preview) = get_conversation_summary(conn, conversation_id)?;
-
-    Ok(ConversationWithTags {
-        conversation,
-        tags,
-        message_count,
-        last_message_preview,
-    })
+    reload_after_scope_change(conn, conversation_id)
 }
 
 // ==================== Message DB Operations ====================
@@ -811,8 +793,8 @@ pub fn save_citations(
 ) -> Result<(), AtomicCoreError> {
     for citation in citations {
         conn.execute(
-            "INSERT INTO chat_citations (id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO chat_citations (id, message_id, citation_index, atom_id, chunk_index, excerpt, relevance_score, source_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 &citation.id,
                 message_id,
@@ -821,59 +803,130 @@ pub fn save_citations(
                 citation.chunk_index,
                 &citation.excerpt,
                 citation.relevance_score,
+                &citation.source_type,
             ],
         )?;
     }
     Ok(())
 }
 
-/// Get scope tag IDs for a conversation
-pub fn get_scope_tag_ids(
+/// Get the retrieval scope for a conversation.
+pub fn get_conversation_scope(
     conn: &Connection,
     conversation_id: &str,
-) -> Result<Vec<String>, AtomicCoreError> {
+) -> Result<ScopeFilter, AtomicCoreError> {
     let mut stmt =
-        conn.prepare("SELECT tag_id FROM conversation_tags WHERE conversation_id = ?1")?;
+        conn.prepare("SELECT tag_id, mode FROM conversation_tags WHERE conversation_id = ?1")?;
 
-    let tag_ids = stmt
-        .query_map([conversation_id], |row| row.get(0))?
+    let rows = stmt
+        .query_map([conversation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ScopeMode::from_db(&row.get::<_, String>(1)?),
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(tag_ids)
+    let mut scope = ScopeFilter::default();
+    for (tag_id, mode) in rows {
+        scope.push(tag_id, mode);
+    }
+    Ok(scope)
 }
 
-/// Get scope description for system prompt
-pub fn get_scope_description(conn: &Connection, tag_ids: &[String]) -> String {
-    if tag_ids.is_empty() {
+/// Describe a scope for the system prompt, given resolved tag names.
+///
+/// Shared by both backends so the model is told the same contract the
+/// retrieval layer enforces. Tags whose names don't resolve are dropped from
+/// the lists — naming an id back to the model teaches it nothing — but every
+/// branch here keys off the *filter*, never off the names that survived
+/// resolution. A scope whose tags all failed to resolve is still a scope, and
+/// telling the model it has "ALL atoms" when retrieval will hand it a subset
+/// is the one lie this paragraph must not tell.
+pub(crate) fn describe_scope(
+    scope: &ScopeFilter,
+    names: &std::collections::HashMap<String, String>,
+) -> String {
+    let named = |ids: &[String]| -> Vec<String> {
+        ids.iter()
+            .filter_map(|id| names.get(id).cloned())
+            .collect::<Vec<_>>()
+    };
+    let (include, require, exclude) = (
+        named(&scope.include),
+        named(&scope.require),
+        named(&scope.exclude),
+    );
+
+    if scope.is_empty() {
         return "You have access to ALL atoms in the knowledge base.".to_string();
     }
 
-    let placeholders: Vec<String> = (0..tag_ids.len()).map(|i| format!("?{}", i + 1)).collect();
+    let mut sentences = Vec::new();
+    if scope.include.is_empty() {
+        sentences.push("You have access to all atoms in the knowledge base, with the filters below applied to every search.".to_string());
+    } else if include.is_empty() {
+        sentences.push("You have access to a narrowed set of atoms: only those under the tags the user put in scope.".to_string());
+    } else {
+        sentences.push(format!(
+            "You have access to atoms tagged with any of: {}. Focus your search on these topics.",
+            include.join(", ")
+        ));
+    }
+    if !scope.require.is_empty() {
+        sentences.push(if require.is_empty() {
+            "Some atoms are further required to carry every tag the user marked as required."
+                .to_string()
+        } else {
+            format!(
+                "Only atoms tagged with every one of: {} are in scope.",
+                require.join(", ")
+            )
+        });
+    }
+    if !scope.exclude.is_empty() {
+        sentences.push(if exclude.is_empty() {
+            "Atoms under the tags the user excluded will never appear in your search results."
+                .to_string()
+        } else {
+            format!(
+                "Atoms tagged with any of: {} are excluded and will never appear in your search results.",
+                exclude.join(", ")
+            )
+        });
+    }
+    sentences.push("A tag also covers its child tags. Every tool enforces this scope — search, tag listings, articles, findings and reads by id alike — so you cannot widen it, and asking for something outside it will be refused rather than answered.".to_string());
+    sentences.join(" ")
+}
+
+/// Get scope description for system prompt
+pub fn get_scope_description(conn: &Connection, scope: &ScopeFilter) -> String {
+    let roots = scope.roots();
+    if roots.is_empty() {
+        return describe_scope(scope, &std::collections::HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (0..roots.len()).map(|i| format!("?{}", i + 1)).collect();
     let query = format!(
-        "SELECT name FROM tags WHERE id IN ({})",
+        "SELECT id, name FROM tags WHERE id IN ({})",
         placeholders.join(", ")
     );
 
-    let mut stmt = match conn.prepare(&query) {
-        Ok(s) => s,
-        Err(_) => return "You have access to a scoped set of atoms.".to_string(),
+    // Names are a nicety; the scope itself is not. A lookup that fails still
+    // describes the shape of the filter, because retrieval will apply it
+    // whether or not the prompt could name it.
+    let names: std::collections::HashMap<String, String> = match conn.prepare(&query) {
+        Ok(mut stmt) => {
+            let params: Vec<&dyn rusqlite::ToSql> =
+                roots.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            stmt.query_map(params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+        Err(_) => std::collections::HashMap::new(),
     };
 
-    let params: Vec<&dyn rusqlite::ToSql> =
-        tag_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-    let names: Vec<String> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    if names.is_empty() {
-        "You have access to a scoped set of atoms.".to_string()
-    } else {
-        format!(
-            "You have access to atoms tagged with: {}. Focus your search on these topics.",
-            names.join(", ")
-        )
-    }
+    describe_scope(scope, &names)
 }
 
 /// Get conversation messages in provider Message format
@@ -949,7 +1002,7 @@ mod tests {
 
         let result = create_conversation(&conn, &[tag_id.clone()], Some("Tagged Chat")).unwrap();
         assert_eq!(result.tags.len(), 1);
-        assert_eq!(result.tags[0].name, "TestTag");
+        assert_eq!(result.tags[0].tag.name, "TestTag");
     }
 
     #[test]
@@ -960,8 +1013,28 @@ mod tests {
         create_conversation(&conn, &[], Some("Chat 1")).unwrap();
         create_conversation(&conn, &[], Some("Chat 2")).unwrap();
 
-        let conversations = get_conversations(&conn, None, 10, 0).unwrap();
+        let conversations = get_conversations(&conn, None, 10, 0, false).unwrap();
         assert_eq!(conversations.len(), 2);
+    }
+
+    #[test]
+    fn test_get_conversations_archive_visibility() {
+        let (db, _temp) = setup_db();
+        let conn = db.conn.lock().unwrap();
+
+        let kept = create_conversation(&conn, &[], Some("Kept")).unwrap();
+        let archived = create_conversation(&conn, &[], Some("Archived")).unwrap();
+        update_conversation(&conn, &archived.conversation.id, None, Some(true)).unwrap();
+
+        let visible = get_conversations(&conn, None, 10, 0, false).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].conversation.id, kept.conversation.id);
+
+        let all = get_conversations(&conn, None, 10, 0, true).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .any(|c| c.conversation.id == archived.conversation.id && c.conversation.is_archived));
     }
 
     #[test]
@@ -990,6 +1063,53 @@ mod tests {
         let updated =
             update_conversation(&conn, &conv.conversation.id, Some("Updated"), None).unwrap();
         assert_eq!(updated.title, Some("Updated".to_string()));
+    }
+
+    /// The auto-titler's write path. Its pre-flight check happens before a
+    /// model call that can take seconds, so the only thing standing between a
+    /// user's rename and a generated title clobbering it is this statement
+    /// re-checking as it writes.
+    #[test]
+    fn a_generated_title_only_lands_while_the_conversation_is_unnamed() {
+        let (db, _temp) = setup_db();
+        let conn = db.conn.lock().unwrap();
+
+        let untitled = create_conversation(&conn, &[], None).unwrap();
+        assert!(
+            set_title_if_unset(&conn, &untitled.conversation.id, "Generated").unwrap(),
+            "an untitled conversation takes the generated name"
+        );
+        assert_eq!(
+            get_conversation(&conn, &untitled.conversation.id)
+                .unwrap()
+                .unwrap()
+                .conversation
+                .title
+                .as_deref(),
+            Some("Generated")
+        );
+
+        // The rename the user typed while the model was thinking.
+        update_conversation(&conn, &untitled.conversation.id, Some("Renamed"), None).unwrap();
+        assert!(
+            !set_title_if_unset(&conn, &untitled.conversation.id, "Generated Again").unwrap(),
+            "a named conversation refuses the write, and reports that it did"
+        );
+        assert_eq!(
+            get_conversation(&conn, &untitled.conversation.id)
+                .unwrap()
+                .unwrap()
+                .conversation
+                .title
+                .as_deref(),
+            Some("Renamed"),
+            "the user's name is the one that stands"
+        );
+
+        assert!(
+            !set_title_if_unset(&conn, "no-such-conversation", "Generated").unwrap(),
+            "and a conversation that no longer exists is not an error, just a no-op"
+        );
     }
 
     #[test]
@@ -1027,12 +1147,27 @@ mod tests {
         let conv = create_conversation(&conn, &[], None).unwrap();
 
         // Add tag
-        let result = add_tag_to_scope(&conn, &conv.conversation.id, &tag1_id).unwrap();
+        let result =
+            add_tag_to_scope(&conn, &conv.conversation.id, &tag1_id, ScopeMode::Include).unwrap();
         assert_eq!(result.tags.len(), 1);
 
         // Add another tag
-        let result = add_tag_to_scope(&conn, &conv.conversation.id, &tag2_id).unwrap();
+        let result =
+            add_tag_to_scope(&conn, &conv.conversation.id, &tag2_id, ScopeMode::Exclude).unwrap();
         assert_eq!(result.tags.len(), 2);
+
+        // Re-adding a tag changes its mode instead of duplicating it
+        let result =
+            add_tag_to_scope(&conn, &conv.conversation.id, &tag2_id, ScopeMode::Require).unwrap();
+        assert_eq!(result.tags.len(), 2);
+        assert_eq!(
+            result
+                .tags
+                .iter()
+                .find(|t| t.tag.id == tag2_id)
+                .map(|t| t.mode),
+            Some(ScopeMode::Require)
+        );
 
         // Remove tag
         let result = remove_tag_from_scope(&conn, &conv.conversation.id, &tag1_id).unwrap();
@@ -1042,10 +1177,23 @@ mod tests {
         let result = set_conversation_scope(
             &conn,
             &conv.conversation.id,
-            &[tag1_id.clone(), tag2_id.clone()],
+            &[
+                ScopeEntry {
+                    tag_id: tag1_id.clone(),
+                    mode: ScopeMode::Include,
+                },
+                ScopeEntry {
+                    tag_id: tag2_id.clone(),
+                    mode: ScopeMode::Exclude,
+                },
+            ],
         )
         .unwrap();
         assert_eq!(result.tags.len(), 2);
+
+        let scope = get_conversation_scope(&conn, &conv.conversation.id).unwrap();
+        assert_eq!(scope.include, vec![tag1_id]);
+        assert_eq!(scope.exclude, vec![tag2_id]);
     }
 
     #[test]
@@ -1093,7 +1241,7 @@ mod tests {
         .unwrap();
 
         // Must not panic.
-        let conversations = get_conversations(&conn, None, 10, 0).unwrap();
+        let conversations = get_conversations(&conn, None, 10, 0, false).unwrap();
         assert_eq!(conversations.len(), 1);
         let preview = conversations[0]
             .last_message_preview
