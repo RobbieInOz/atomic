@@ -492,7 +492,11 @@ async fn test_tag_wiki_prompts_round_trip(storage: &dyn TagStore) {
         )
         .await
         .unwrap();
-    let saved = storage.get_tag_wiki_prompts(&tag.id).await.unwrap().unwrap();
+    let saved = storage
+        .get_tag_wiki_prompts(&tag.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         saved.generation_prompt.as_deref(),
         Some("Collect the unchecked tasks.")
@@ -513,7 +517,11 @@ async fn test_tag_wiki_prompts_round_trip(storage: &dyn TagStore) {
         )
         .await
         .unwrap();
-    let saved = storage.get_tag_wiki_prompts(&tag.id).await.unwrap().unwrap();
+    let saved = storage
+        .get_tag_wiki_prompts(&tag.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         saved.generation_prompt.as_deref(),
         Some("Collect the unchecked tasks.")
@@ -531,7 +539,11 @@ async fn test_tag_wiki_prompts_round_trip(storage: &dyn TagStore) {
         )
         .await
         .unwrap();
-    let cleared = storage.get_tag_wiki_prompts(&tag.id).await.unwrap().unwrap();
+    let cleared = storage
+        .get_tag_wiki_prompts(&tag.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         cleared.generation_prompt.is_none(),
         "blank text must clear the override, not store an empty prompt"
@@ -1606,6 +1618,68 @@ mod postgres_tests {
         pg_tag_wiki_prompts_round_trip,
         test_tag_wiki_prompts_round_trip
     );
+
+    /// `tags.id` is a global primary key on Postgres: several logical
+    /// databases share the table, and the `AND db_id = $n` predicate in the
+    /// wiki-prompt queries is the entire fence between them. This is the only
+    /// test that puts two db_ids in front of it.
+    #[tokio::test]
+    async fn pg_tag_wiki_prompts_fenced_by_db_id() {
+        let Some(ref owner) = postgres_storage().await else {
+            eprintln!(
+                "Skipping pg_tag_wiki_prompts_fenced_by_db_id (ATOMIC_TEST_DATABASE_URL not set)"
+            );
+            return;
+        };
+        // Connected after `postgres_storage`, whose truncate would otherwise
+        // wipe the tag this test just seeded.
+        let url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
+        let neighbor = atomic_core::storage::PostgresStorage::connect(&url, "test-neighbor")
+            .await
+            .unwrap();
+
+        let tag = owner.create_tag("FencedDiary", None).await.unwrap();
+        owner
+            .set_tag_wiki_prompts(
+                &tag.id,
+                &TagWikiPrompts {
+                    generation_prompt: Some("Only this database may see it.".to_string()),
+                    update_prompt: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            neighbor
+                .get_tag_wiki_prompts(&tag.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another database's tag must read as absent, not as its prompts"
+        );
+        assert!(
+            matches!(
+                neighbor
+                    .set_tag_wiki_prompts(&tag.id, &TagWikiPrompts::default())
+                    .await,
+                Err(AtomicCoreError::NotFound(_))
+            ),
+            "another database's tag must not be writable"
+        );
+
+        let owned = owner
+            .get_tag_wiki_prompts(&tag.id)
+            .await
+            .unwrap()
+            .expect("the owning database still sees its tag");
+        assert_eq!(
+            owned.generation_prompt.as_deref(),
+            Some("Only this database may see it."),
+            "the rejected cross-database write must not have landed"
+        );
+    }
+
     pg_test!(pg_list_runnable_task_runs, test_list_runnable_task_runs);
     pg_test!(
         pg_gc_task_runs_never_deletes_non_terminal,

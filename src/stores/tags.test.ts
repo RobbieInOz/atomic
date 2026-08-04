@@ -50,6 +50,22 @@ describe('tag wiki prompts', () => {
     expect(result).toEqual(prompts('write a checklist', null));
   });
 
+  it('writes the tag the caller named, not one riding on the payload', async () => {
+    // The prompts object is caller data; a stray `id` on it must not be able
+    // to redirect the write onto a different tag.
+    invoke.mockResolvedValue(prompts('write a checklist', null));
+
+    await useTagsStore
+      .getState()
+      .saveTagWikiPrompts(TAG, { ...prompts('write a checklist', null), id: 'other-tag' } as TagWikiPrompts);
+
+    expect(invoke).toHaveBeenCalledWith('set_tag_wiki_prompts', {
+      id: TAG,
+      generation_prompt: 'write a checklist',
+      update_prompt: null,
+    });
+  });
+
   it('surfaces failures to the caller and to the store', async () => {
     invoke.mockRejectedValue(new Error('tag not found'));
 
@@ -60,5 +76,15 @@ describe('tag wiki prompts', () => {
       useTagsStore.getState().saveTagWikiPrompts(TAG, prompts('x', null)),
     ).rejects.toThrow('tag not found');
     expect(useTagsStore.getState().error).toContain('tag not found');
+  });
+
+  it('rejects with whatever the transport threw, including a bare string', async () => {
+    // The HTTP transport throws the raw error body rather than an Error, and
+    // an error response with no body throws `''`. UI that renders the message
+    // has to supply its own fallback text — see TagWikiPromptModal.
+    invoke.mockRejectedValue('');
+
+    await expect(useTagsStore.getState().fetchTagWikiPrompts(TAG)).rejects.toBe('');
+    expect(useTagsStore.getState().error).toBe('');
   });
 });

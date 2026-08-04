@@ -757,9 +757,17 @@ pub async fn get_tag_wiki_prompts(db: Db, path: web::Path<String>) -> HttpRespon
     let id = path.into_inner();
     match db.0.get_tag_wiki_prompts(&id).await {
         Ok(Some(prompts)) => HttpResponse::Ok().json(prompts),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "Tag not found"})),
+        Ok(None) => tag_not_found(),
         Err(e) => crate::error::error_response(e),
     }
+}
+
+/// The one body both wiki-prompt routes answer an unknown tag with. GET learns
+/// of the missing tag as `Ok(None)` and PUT as a storage `NotFound`, whose
+/// rendering ("Not found: tag <id>") the modal would otherwise show verbatim
+/// for the identical condition.
+fn tag_not_found() -> HttpResponse {
+    HttpResponse::NotFound().json(serde_json::json!({"error": "Tag not found"}))
 }
 
 #[utoipa::path(
@@ -787,6 +795,7 @@ pub async fn set_tag_wiki_prompts(
     let prompts = body.into_inner().normalized();
     match db.0.set_tag_wiki_prompts(&id, &prompts).await {
         Ok(()) => HttpResponse::Ok().json(prompts),
+        Err(atomic_core::AtomicCoreError::NotFound(_)) => tag_not_found(),
         Err(e) => crate::error::error_response(e),
     }
 }

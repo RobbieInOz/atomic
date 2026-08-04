@@ -269,8 +269,10 @@ export const useTagsStore = create<TagsStore>((set, get) => ({
     set({ error: null });
     try {
       // The server normalizes blank prompts to null and echoes the stored
-      // record back, so the response is what the tag now has.
-      return await getTransport().invoke<TagWikiPrompts>('set_tag_wiki_prompts', { id, ...prompts });
+      // record back, so the response is what the tag now has. `id` is spread
+      // last so the tag being written is always the one the caller named,
+      // whatever the prompts object happens to carry.
+      return await getTransport().invoke<TagWikiPrompts>('set_tag_wiki_prompts', { ...prompts, id });
     } catch (error) {
       set({ error: String(error) });
       throw error;

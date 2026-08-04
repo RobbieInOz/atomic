@@ -1181,6 +1181,13 @@ impl Database {
         // NULL means "no override" — the resolver in
         // `AtomicCore::build_wiki_strategy_context` then falls through to the
         // global setting and finally the built-in prompt.
+        //
+        // Two ALTERs and the version bump run in one transaction. Left to
+        // autocommit they land separately, and the probe below only asks about
+        // the *first* column: a crash between the two ALTERs would re-enter
+        // with `has_col` true, skip the second column, and stamp 25 over a
+        // schema that has no `wiki_update_prompt` — every wiki read then fails
+        // for good, with no version left to repair it.
         if version < 25 {
             let has_col: bool = conn
                 .query_row(
@@ -1190,15 +1197,26 @@ impl Database {
                 )
                 .unwrap_or(false);
 
+            let tx = conn.unchecked_transaction()?;
             if !has_col {
-                conn.execute_batch(
+                tx.execute_batch(
                     "ALTER TABLE tags ADD COLUMN wiki_generation_prompt TEXT;
                      ALTER TABLE tags ADD COLUMN wiki_update_prompt TEXT;",
                 )?;
             }
-
-            conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
+            tx.execute_batch("PRAGMA user_version = 25;")?;
+            tx.commit()?;
         }
+
+        // Each block above stamps its own literal N, while `LATEST_VERSION` is
+        // a separate declaration; a new migration that bumps one without the
+        // other is a skew nothing else would catch. Debug builds — every test
+        // run — assert the two agree.
+        debug_assert_eq!(
+            conn.query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))?,
+            Self::LATEST_VERSION,
+            "migrations must leave the database at LATEST_VERSION"
+        );
 
         // --- Triggers (recreated every startup to stay current) ---
         conn.execute_batch(

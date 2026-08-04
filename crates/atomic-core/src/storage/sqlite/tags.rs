@@ -289,11 +289,7 @@ impl SqliteStorage {
         &self,
         id: &str,
     ) -> StorageResult<Option<TagWikiPrompts>> {
-        let conn = self
-            .db
-            .conn
-            .lock()
-            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let conn = self.db.read_conn()?;
         conn.query_row(
             "SELECT wiki_generation_prompt, wiki_update_prompt FROM tags WHERE id = ?1",
             [id],

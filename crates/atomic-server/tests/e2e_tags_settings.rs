@@ -396,11 +396,7 @@ where
     (status, actix_test::read_body_json(resp).await)
 }
 
-async fn get_wiki_prompts<S, B>(
-    app: &S,
-    auth: (&'static str, String),
-    tag_id: &str,
-) -> (u16, Value)
+async fn get_wiki_prompts<S, B>(app: &S, auth: (&'static str, String), tag_id: &str) -> (u16, Value)
 where
     S: actix_web::dev::Service<
         actix_http::Request,
@@ -513,10 +509,14 @@ async fn run_tag_wiki_prompts_unknown_tag_404(backend: Backend) {
     };
     let app = actix_test::init_service(test_app(&ctx)).await;
 
-    let (status, _) = get_wiki_prompts(&app, ctx.auth_header(), "no-such-tag").await;
+    // The modal renders these bodies verbatim, so the two verbs must answer
+    // the identical condition identically — PUT learns of the missing tag as
+    // a storage `NotFound`, whose own rendering names the id.
+    let (status, body) = get_wiki_prompts(&app, ctx.auth_header(), "no-such-tag").await;
     assert_eq!(status, 404, "GET on an unknown tag must 404");
+    assert_eq!(body, json!({ "error": "Tag not found" }));
 
-    let (status, _) = put_wiki_prompts(
+    let (status, body) = put_wiki_prompts(
         &app,
         ctx.auth_header(),
         "no-such-tag",
@@ -524,6 +524,55 @@ async fn run_tag_wiki_prompts_unknown_tag_404(backend: Backend) {
     )
     .await;
     assert_eq!(status, 404, "PUT on an unknown tag must 404");
+    assert_eq!(body, json!({ "error": "Tag not found" }));
+}
+
+#[actix_web::test]
+async fn tag_wiki_prompts_require_auth_sqlite() {
+    run_tag_wiki_prompts_require_auth(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn tag_wiki_prompts_require_auth_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "tag_wiki_prompts_require_auth_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_tag_wiki_prompts_require_auth(Backend::Postgres).await;
+}
+
+async fn run_tag_wiki_prompts_require_auth(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+    let id = create_tag(&app, ctx.auth_header(), "GuardedPrompts", None).await;
+
+    for req in [
+        actix_test::TestRequest::get()
+            .uri(&format!("/api/tags/{id}/wiki-prompts"))
+            .to_request(),
+        actix_test::TestRequest::put()
+            .uri(&format!("/api/tags/{id}/wiki-prompts"))
+            .set_json(json!({ "generation_prompt": "unauthorized" }))
+            .to_request(),
+    ] {
+        let err = match actix_test::try_call_service(&app, req).await {
+            Ok(resp) => panic!(
+                "wiki-prompts must reject missing tokens, got {}",
+                resp.status()
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(err.as_response_error().error_response().status(), 401);
+    }
+
+    // The rejected PUT must not have written anything.
+    let (status, body) = get_wiki_prompts(&app, ctx.auth_header(), &id).await;
+    assert_eq!(status, 200);
+    assert!(body["generation_prompt"].is_null());
 }
 
 // ==================== S1. Setting round-trip ====================
