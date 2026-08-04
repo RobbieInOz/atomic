@@ -2,6 +2,15 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.43.0 — 2026-08-04
+
+- Add a fully streaming chat experience with token-by-token rendering, stop/cancel, auto-titled conversations, boolean scope modes (include/require/exclude), knowledge-base tools (tags, wikis, reports), cited sources, save-answer-as-atom, and a fullscreen desktop mode
+- Add a contextual left sidebar that adapts to the current view — table of contents with scrollspy in readers, article list in the wiki view, recent atoms on the dashboard, and latest findings on reports
+- Expand the MCP server from 6 to 16 tools — adds tag browsing, wiki and report reading, semantic neighbors, database listing, and atom pagination — with per-client setup docs for Claude, Cursor, and ChatGPT
+- (Cloud) Improve wiki update reliability by switching to section-level edits that preserve untouched content byte-for-byte, and fix multiple AI-provider truncation issues that could produce cut-off wiki articles and report digests
+- Polish the top bar and chat UI — icon-only database switcher, centered send button, hover-revealed conversation actions, and report name as the dashboard heading instead of a generic greeting
+- (Cloud) Fix global search failing on cloud, canvas clusters showing generic names instead of topic labels, and multiple memory-retention issues with WebSocket and MCP session cleanup
+
 ## v1.42.2 — 2026-07-13
 
 - Fix embedding failures on atoms with very large code blocks (e.g. RSS-ingested posts with 60KB+ fenced code) by splitting oversized blocks at line boundaries
