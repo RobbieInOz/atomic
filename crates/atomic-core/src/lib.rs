@@ -1735,6 +1735,24 @@ impl AtomicCore {
             .await
     }
 
+    /// Read a tag's wiki prompt overrides. `None` when the tag doesn't exist.
+    pub async fn get_tag_wiki_prompts(
+        &self,
+        id: &str,
+    ) -> Result<Option<TagWikiPrompts>, AtomicCoreError> {
+        self.storage.get_tag_wiki_prompts_impl(id).await
+    }
+
+    /// Replace a tag's wiki prompt overrides. Takes effect the next time the
+    /// tag's article is generated or updated — nothing is regenerated here.
+    pub async fn set_tag_wiki_prompts(
+        &self,
+        id: &str,
+        prompts: &TagWikiPrompts,
+    ) -> Result<(), AtomicCoreError> {
+        self.storage.set_tag_wiki_prompts_impl(id, prompts).await
+    }
+
     /// Configure auto-tag targets in one shot — used by the onboarding wizard
     /// and the settings tab.
     ///
@@ -1933,6 +1951,13 @@ impl AtomicCore {
                 .map(|s| s.as_str())
                 .unwrap_or("centroid"),
         );
+        // A tag deleted out from under an in-flight generation resolves as
+        // "no overrides"; the missing tag surfaces on the caller's own path.
+        let tag_prompts = self
+            .storage
+            .get_tag_wiki_prompts_impl(tag_id)
+            .await?
+            .unwrap_or_default();
         let related = self
             .storage
             .get_related_tags_impl(tag_id, MAX_CROSS_LINK_TAGS)
@@ -1952,8 +1977,15 @@ impl AtomicCore {
             tag_id: tag_id.to_string(),
             tag_name: tag_name.to_string(),
             linkable_article_names,
-            custom_generation_prompt: settings_map.get("wiki_generation_prompt").cloned(),
-            custom_update_prompt: settings_map.get("wiki_update_prompt").cloned(),
+            // Precedence, per field independently: this tag's override, then
+            // the global custom prompt, then the built-in default (applied by
+            // `WikiStrategyContext` when both are absent).
+            custom_generation_prompt: tag_prompts
+                .generation_prompt
+                .or_else(|| settings_map.get("wiki_generation_prompt").cloned()),
+            custom_update_prompt: tag_prompts
+                .update_prompt
+                .or_else(|| settings_map.get("wiki_update_prompt").cloned()),
         };
         Ok((strategy, ctx))
     }

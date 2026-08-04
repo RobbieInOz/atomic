@@ -367,6 +367,165 @@ async fn run_tag_compaction_merges_pair(backend: Backend) {
     );
 }
 
+// ==================== T8. Per-tag wiki prompts ====================
+
+/// GET/PUT `/api/tags/{id}/wiki-prompts`. The PUT body is the same shape it
+/// returns, and blank text clears an override rather than storing it — a
+/// stored empty prompt would shadow the global one instead of falling back.
+async fn put_wiki_prompts<S, B>(
+    app: &S,
+    auth: (&'static str, String),
+    tag_id: &str,
+    body: Value,
+) -> (u16, Value)
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    let req = actix_test::TestRequest::put()
+        .uri(&format!("/api/tags/{tag_id}/wiki-prompts"))
+        .insert_header(auth)
+        .set_json(body)
+        .to_request();
+    let resp = actix_test::call_service(app, req).await;
+    let status = resp.status().as_u16();
+    (status, actix_test::read_body_json(resp).await)
+}
+
+async fn get_wiki_prompts<S, B>(
+    app: &S,
+    auth: (&'static str, String),
+    tag_id: &str,
+) -> (u16, Value)
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/api/tags/{tag_id}/wiki-prompts"))
+        .insert_header(auth)
+        .to_request();
+    let resp = actix_test::call_service(app, req).await;
+    let status = resp.status().as_u16();
+    (status, actix_test::read_body_json(resp).await)
+}
+
+#[actix_web::test]
+async fn tag_wiki_prompts_round_trip_sqlite() {
+    run_tag_wiki_prompts_round_trip(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn tag_wiki_prompts_round_trip_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "tag_wiki_prompts_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_tag_wiki_prompts_round_trip(Backend::Postgres).await;
+}
+
+async fn run_tag_wiki_prompts_round_trip(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+    let id = create_tag(&app, ctx.auth_header(), "TodoSummary", None).await;
+
+    let (status, body) = get_wiki_prompts(&app, ctx.auth_header(), &id).await;
+    assert_eq!(status, 200);
+    assert!(body["generation_prompt"].is_null());
+    assert!(body["update_prompt"].is_null());
+
+    let (status, body) = put_wiki_prompts(
+        &app,
+        ctx.auth_header(),
+        &id,
+        json!({
+            "generation_prompt": "  List every unchecked task.  ",
+            "update_prompt": "Fold new tasks into the existing list.",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["generation_prompt"], "List every unchecked task.",
+        "PUT must answer with the normalized (trimmed) prompt it stored"
+    );
+    assert_eq!(
+        body["update_prompt"],
+        "Fold new tasks into the existing list."
+    );
+
+    let (status, body) = get_wiki_prompts(&app, ctx.auth_header(), &id).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["generation_prompt"], "List every unchecked task.");
+    assert_eq!(
+        body["update_prompt"],
+        "Fold new tasks into the existing list."
+    );
+
+    // Blank text clears one field; an omitted field clears the other.
+    let (status, body) = put_wiki_prompts(
+        &app,
+        ctx.auth_header(),
+        &id,
+        json!({ "generation_prompt": "   " }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body["generation_prompt"].is_null());
+    assert!(body["update_prompt"].is_null());
+
+    let (_, body) = get_wiki_prompts(&app, ctx.auth_header(), &id).await;
+    assert!(body["generation_prompt"].is_null());
+    assert!(body["update_prompt"].is_null());
+}
+
+#[actix_web::test]
+async fn tag_wiki_prompts_unknown_tag_404_sqlite() {
+    run_tag_wiki_prompts_unknown_tag_404(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn tag_wiki_prompts_unknown_tag_404_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "tag_wiki_prompts_unknown_tag_404_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_tag_wiki_prompts_unknown_tag_404(Backend::Postgres).await;
+}
+
+async fn run_tag_wiki_prompts_unknown_tag_404(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    let (status, _) = get_wiki_prompts(&app, ctx.auth_header(), "no-such-tag").await;
+    assert_eq!(status, 404, "GET on an unknown tag must 404");
+
+    let (status, _) = put_wiki_prompts(
+        &app,
+        ctx.auth_header(),
+        "no-such-tag",
+        json!({ "generation_prompt": "orphan" }),
+    )
+    .await;
+    assert_eq!(status, 404, "PUT on an unknown tag must 404");
+}
+
 // ==================== S1. Setting round-trip ====================
 
 #[actix_web::test]

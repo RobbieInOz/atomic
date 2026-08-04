@@ -684,3 +684,83 @@ async fn run_distinct_tags_generate_concurrently(backend: Backend) {
         assert_eq!(history[0].subject_id.as_deref(), Some(tag_id.as_str()));
     }
 }
+
+// ==================== 10. Per-tag prompt beats the global setting ====================
+
+/// A tag-level generation prompt fully replaces the global custom prompt,
+/// which in turn replaces the built-in default. The assertion reads the
+/// system message the mock provider actually received, so it fails if the
+/// resolver in `build_wiki_strategy_context` stops preferring the tag.
+const GLOBAL_WIKI_PROMPT: &str = "GLOBAL-WIKI-PROMPT: write it the house way.";
+const TAG_WIKI_PROMPT: &str = "TAG-WIKI-PROMPT: list only the unchecked tasks.";
+
+#[actix_web::test]
+async fn tag_prompt_overrides_global_wiki_prompt_sqlite() {
+    run_tag_prompt_overrides_global_wiki_prompt(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn tag_prompt_overrides_global_wiki_prompt_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "tag_prompt_overrides_global_wiki_prompt_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_tag_prompt_overrides_global_wiki_prompt(Backend::Postgres).await;
+}
+
+async fn run_tag_prompt_overrides_global_wiki_prompt(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    active_core(&ctx)
+        .await
+        .set_setting("wiki_generation_prompt", GLOBAL_WIKI_PROMPT)
+        .await
+        .expect("seed global wiki prompt");
+
+    let tag_id = create_tag(&app, ctx.auth_header(), "TodoWiki").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "- [ ] renew the domain\n- [x] pay the invoice",
+        &[tag_id.as_str()],
+    )
+    .await;
+
+    let req = actix_test::TestRequest::put()
+        .uri(&format!("/api/tags/{tag_id}/wiki-prompts"))
+        .insert_header(ctx.auth_header())
+        .set_json(json!({ "generation_prompt": TAG_WIKI_PROMPT }))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "saving the tag's prompt must succeed");
+
+    generate_wiki(&app, ctx.auth_header(), &tag_id, "TodoWiki").await;
+
+    let system_prompts: Vec<String> = ctx
+        .mock
+        .chat_request_bodies()
+        .iter()
+        .filter_map(|body| {
+            body["messages"]
+                .as_array()?
+                .iter()
+                .find(|m| m["role"] == "system")?["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+
+    assert!(
+        system_prompts.iter().any(|p| p == TAG_WIKI_PROMPT),
+        "generation must run on the tag's prompt; system prompts seen: {system_prompts:?}"
+    );
+    assert!(
+        !system_prompts.iter().any(|p| p.contains(GLOBAL_WIKI_PROMPT)),
+        "the tag override replaces the global prompt outright; system prompts seen: {system_prompts:?}"
+    );
+}

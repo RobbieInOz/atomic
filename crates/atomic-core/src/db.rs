@@ -281,7 +281,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 24;
+    const LATEST_VERSION: i32 = 25;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -1171,6 +1171,29 @@ impl Database {
             if !has_col {
                 conn.execute_batch(
                     "ALTER TABLE conversation_tags ADD COLUMN mode TEXT NOT NULL DEFAULT 'include';",
+                )?;
+            }
+
+            conn.execute_batch("PRAGMA user_version = 24;")?;
+        }
+
+        // V25: a tag can override the wiki prompts used for its own article.
+        // NULL means "no override" — the resolver in
+        // `AtomicCore::build_wiki_strategy_context` then falls through to the
+        // global setting and finally the built-in prompt.
+        if version < 25 {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('tags') WHERE name='wiki_generation_prompt'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE tags ADD COLUMN wiki_generation_prompt TEXT;
+                     ALTER TABLE tags ADD COLUMN wiki_update_prompt TEXT;",
                 )?;
             }
 
