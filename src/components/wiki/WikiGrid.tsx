@@ -15,6 +15,10 @@ interface WikiGridProps {
   suggestedArticles: SuggestedArticle[];
   onArticleClick: (tagId: string, tagName: string, opts?: { newTab?: boolean }) => void;
   onSuggestionClick: (tagId: string, tagName: string, opts?: { newTab?: boolean }) => void;
+  /// Opens the per-tag wiki prompt editor from a card's ⋮ menu. Articles and
+  /// suggestions share it — the tag is all the editor needs, and a suggestion
+  /// is exactly the case where a prompt is worth setting up front.
+  onOpenPrompts: (tagId: string, tagName: string) => void;
   isLoading?: boolean;
 }
 
@@ -27,6 +31,7 @@ export const WikiGrid = memo(function WikiGrid({
   suggestedArticles,
   onArticleClick,
   onSuggestionClick,
+  onOpenPrompts,
   isLoading,
 }: WikiGridProps) {
   const parentRef = useRef<HTMLDivElement>(null);
@@ -123,6 +128,7 @@ export const WikiGrid = memo(function WikiGrid({
                       type="article"
                       article={item.article}
                       onClick={(opts) => onArticleClick(item.article.tag_id, item.article.tag_name, opts)}
+                      onOpenPrompts={() => onOpenPrompts(item.article.tag_id, item.article.tag_name)}
                     />
                   );
                 } else {
@@ -132,6 +138,7 @@ export const WikiGrid = memo(function WikiGrid({
                       type="suggestion"
                       suggestion={item.suggestion}
                       onClick={(opts) => onSuggestionClick(item.suggestion.tag_id, item.suggestion.tag_name, opts)}
+                      onOpenPrompts={() => onOpenPrompts(item.suggestion.tag_id, item.suggestion.tag_name)}
                     />
                   );
                 }
