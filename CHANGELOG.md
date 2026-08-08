@@ -2,6 +2,12 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.44.0 — 2026-08-08
+
+- Add per-tag wiki prompt overrides — customize the generation and update instructions for any tag's wiki article via the tag context menu, wiki card actions, or the reader header
+- Add quick-access ⋮ menus on wiki article cards and suggestion cards for prompt editing, regeneration, and deletion — also makes these actions reachable on touch devices for the first time
+- Fix context menu item clicks incorrectly triggering the underlying card or row action (e.g. opening the reader on top of a just-opened modal)
+
 ## v1.43.0 — 2026-08-04
 
 - Add a fully streaming chat experience with token-by-token rendering, stop/cancel, auto-titled conversations, boolean scope modes (include/require/exclude), knowledge-base tools (tags, wikis, reports), cited sources, save-answer-as-atom, and a fullscreen desktop mode
