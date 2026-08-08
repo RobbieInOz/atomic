@@ -156,6 +156,13 @@ export function ContextMenu({ items, position, onClose, autoFocus = false }: Con
          longer belongs to. */
       data-modal="true"
       onKeyDown={onMenuKeyDown}
+      /* The portal moves the menu's DOM to <body>, but React events still
+         bubble along the component tree — so when a caller renders the menu
+         inside a clickable card/row (WikiCard, ReportRow), an item click
+         would also fire the card's own onClick. A menu's clicks are its own;
+         they end here. */
+      onClick={(e) => e.stopPropagation()}
+      onAuxClick={(e) => e.stopPropagation()}
       className="fixed z-50 min-w-[160px] bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-lg shadow-xl py-1 animate-in fade-in zoom-in-95 duration-100"
       style={{
         left: adjustedPosition?.x ?? position.x,
