@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Clock, RefreshCw } from 'lucide-react';
+import { Clock, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import { useWikiStore } from '../../stores/wiki';
 import { useUIStore } from '../../stores/ui';
+import { TagWikiPromptModal } from '../tags/TagWikiPromptModal';
 import { WikiArticleContent, WIKI_TITLE_ANCHOR_ID } from './WikiArticleContent';
 import { WikiEmptyState } from './WikiEmptyState';
 import { WikiGenerating } from './WikiGenerating';
@@ -70,6 +71,7 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
   const overlayNavigate = useUIStore(s => s.overlayNavigate);
 
   const [showRegenerateModal, setShowRegenerateModal] = useState(false);
+  const [showPromptModal, setShowPromptModal] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
   const versionsRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -319,6 +321,20 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
                 >
                   <RefreshCw className="w-4 h-4" strokeWidth={2} />
                 </Button>
+                {/* Wiki prompt. Unlike Regenerate it stays enabled while an
+                    older version is on screen: it edits the instructions the
+                    *next* generation runs with, not the article — and reading
+                    back a version you didn't want is a common reason to go
+                    change them. */}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowPromptModal(true)}
+                  title="Wiki Prompt"
+                  aria-label="Wiki Prompt"
+                >
+                  <SlidersHorizontal className="w-4 h-4" strokeWidth={2} />
+                </Button>
               </>
             }
             onViewAtom={handleViewAtom}
@@ -326,6 +342,13 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
           />
         </div>
       )}
+
+      {/* Wiki Prompt Modal */}
+      <TagWikiPromptModal
+        isOpen={showPromptModal}
+        tag={{ id: tagId, name: tagName }}
+        onClose={() => setShowPromptModal(false)}
+      />
 
       {/* Regenerate confirmation modal */}
       <Modal
