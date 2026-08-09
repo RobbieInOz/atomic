@@ -243,13 +243,76 @@ fn early_end_reason(response: &CompletionResponse) -> Option<&str> {
         .or_else(|| response.native_finish_reason.as_deref().filter(|r| is_cut(r)))
 }
 
+/// A concrete illustration of a schema's output shape: the same structure with
+/// every leaf replaced by an angle-bracketed placeholder drawn from the field's
+/// `description`, and enums shown as their alternatives.
+///
+/// Exists because a JSON Schema is itself a JSON document, and "reply with an
+/// object matching this schema" followed by a schema is genuinely ambiguous to
+/// a small model — measured on `llama3.2`, 4 or 5 replies in 8 came back as the
+/// *schema* with the answer nested under `properties`. Showing the shape
+/// instead removes the ambiguity: 8 of 8 valid, with or without the schema also
+/// present.
+///
+/// Placeholders rather than plausible values on purpose. Invented values get
+/// copied — and for an enum whose first variant is the do-nothing case
+/// (`wiki_update_section_ops`), a "realistic" example would nudge the model
+/// straight at the degenerate answer this module exists to avoid.
+fn example_from_schema(schema: &Value) -> Value {
+    let placeholder = |schema: &Value| -> Value {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            let alternatives: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .collect();
+            return Value::String(format!("<{}>", alternatives.join(" | ")));
+        }
+        match schema.get("description").and_then(Value::as_str) {
+            Some(description) => Value::String(format!("<{description}>")),
+            None => Value::String("<value>".to_string()),
+        }
+    };
+
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let mut example = serde_json::Map::new();
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for (name, property) in properties {
+                    example.insert(name.clone(), example_from_schema(property));
+                }
+            }
+            Value::Object(example)
+        }
+        // One element is enough to show the shape; more would suggest a count.
+        Some("array") => match schema.get("items") {
+            Some(items) => Value::Array(vec![example_from_schema(items)]),
+            None => Value::Array(vec![]),
+        },
+        Some("integer") | Some("number") => Value::from(1),
+        Some("boolean") => Value::Bool(true),
+        _ => placeholder(schema),
+    }
+}
+
 /// The prompt-level statement of the output contract, used both as the primary
 /// instruction under [`SchemaEnforcement::PromptOnly`] and as the re-ask in the
 /// fallback. One wording, so the two paths cannot drift apart.
-fn schema_instruction(schema_str: &str) -> String {
+///
+/// Leads with the shape and keeps the schema behind it: the example is what
+/// small models actually follow, and the schema still carries the constraints
+/// an example cannot express (enums, required fields, `additionalProperties`).
+fn schema_instruction(schema: &Value) -> String {
+    let example = serde_json::to_string_pretty(&example_from_schema(schema))
+        .unwrap_or_else(|_| "{}".to_string());
+    let schema_str = serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
     format!(
-        "Reply with ONLY a single JSON object matching this schema. No markdown, \
-         no prose, no code fences, no surrounding text.\n\nSchema:\n{schema_str}"
+        "Reply with ONLY a single JSON object in exactly this form, replacing each \
+         <placeholder> with a real value. No markdown, no prose, no code fences, no \
+         surrounding text.\n\n{example}\n\nThe object must satisfy this JSON Schema:\n{schema_str}"
     )
 }
 
@@ -318,8 +381,6 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         params.with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS)
     };
 
-    let schema_str = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
-
     // Primary attempt. Either the schema rides on the wire as
     // `response_format`, or it rides in the prompt and we parse tolerantly —
     // see `SchemaEnforcement` for why the latter is sometimes the better
@@ -339,7 +400,7 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         }
         SchemaEnforcement::PromptOnly => {
             let mut prompted = messages.to_vec();
-            prompted.push(Message::user(schema_instruction(&schema_str)));
+            prompted.push(Message::user(schema_instruction(&schema)));
             (
                 LlmConfig::new(model.to_string()).with_params(params.clone()),
                 prompted,
@@ -454,7 +515,7 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
     // Reached from `PromptOnly` too, where it re-asks with the sharper wording.
     let nudge = format!(
         "Your previous response could not be parsed. {}",
-        schema_instruction(&schema_str)
+        schema_instruction(&schema)
     );
 
     let mut fallback_messages = messages.to_vec();
@@ -1585,6 +1646,52 @@ mod tests {
         assert!(
             !primary.strict,
             "with_strict(false) must propagate to the outbound request"
+        );
+    }
+
+    /// The instruction must lead with the *shape*, because a schema alone is
+    /// ambiguous to a small model — it is itself a JSON document, and half the
+    /// time `llama3.2` returned that document with the answer buried under
+    /// `properties`.
+    #[test]
+    fn schema_instruction_shows_the_shape_before_the_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operations": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {"type": "string", "enum": ["NoChange", "AppendToSection"],
+                               "description": "Operation type."},
+                        "heading": {"type": "string", "description": "Target heading."}},
+                    "required": ["op", "heading"], "additionalProperties": false}},
+                "citations_used": {"type": "array", "items": {"type": "integer"}}},
+            "required": ["operations", "citations_used"], "additionalProperties": false
+        });
+
+        let example = example_from_schema(&schema);
+        assert_eq!(
+            example,
+            serde_json::json!({
+                "operations": [{"op": "<NoChange | AppendToSection>", "heading": "<Target heading.>"}],
+                "citations_used": [1]
+            }),
+            "descriptions become placeholders; enums list their alternatives"
+        );
+
+        let instruction = schema_instruction(&schema);
+        let example_at = instruction.find("\"operations\"").expect("example present");
+        let schema_at = instruction.find("JSON Schema:").expect("schema present");
+        assert!(
+            example_at < schema_at,
+            "the shape must come first — it is what a weak model follows"
+        );
+        // Enum placeholders must not name a single variant: for section ops the
+        // first variant is the do-nothing case, and a "realistic" example would
+        // point the model straight at the degenerate answer.
+        assert!(
+            !instruction.contains("\"op\": \"NoChange\""),
+            "an enum example must not pick a variant: {instruction}"
         );
     }
 

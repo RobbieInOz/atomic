@@ -4,7 +4,7 @@
 
 use crate::providers::structured::{call_structured, SchemaEnforcement, StructuredCall};
 use crate::providers::types::{GenerationParams, Message};
-use crate::providers::{ProviderConfig, ProviderType};
+use crate::providers::ProviderConfig;
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::sync::{LazyLock, Mutex};
@@ -247,46 +247,30 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
     })
 }
 
-/// How the tagging schema reaches the model — a property of the **provider**,
-/// not of the task alone.
+/// How the tagging schema reaches the model.
 ///
 /// Tag extraction is *generative*: the model decides how many tags to emit, so
 /// a decoder that shortens the output silently changes the answer rather than
-/// just its shape. Measured 2026-08-09, same content and task:
+/// just its shape. Wire-level `response_format` does exactly that on
+/// OpenRouter — measured 2026-08-09 on `google/gemma-4-26b-a4b-it` pinned to
+/// DeepInfra, it returned `{"tags": []}` on 3 calls of 6, with counts swinging
+/// 5–13 on identical input. That failure is **silent**: an empty-but-valid
+/// result parses, so no fallback fires, and the atom is recorded tagged with
+/// nothing. Schema in the prompt returned 4–8 tags on 8 of 8.
 ///
-/// **OpenRouter** (`gemma-4-26b-a4b-it` pinned to DeepInfra) — schema on the
-/// wire returned `{"tags": []}` on 3 calls of 6, and tag counts swung 5–13 on
-/// identical input. Schema in the prompt: 4–8 tags, 8 of 8. This is the failure
-/// that matters, because it is **silent**: an empty-but-valid result parses, so
-/// no fallback fires, and the atom is recorded tagged with nothing.
+/// This started out provider-dependent, on a measurement that said prompt mode
+/// emptied half of `llama3.2`'s extractions. That was wrong twice over: the
+/// model was echoing the *schema* back rather than returning nothing, and it
+/// was doing so because the instruction handed it a JSON Schema document and
+/// asked it to "match this schema" — genuinely ambiguous input for a 3B model.
+/// Once [`crate::providers::structured`] began leading with a concrete example
+/// of the shape, `llama3.2` produced valid output on 8 of 8 first attempts, and
+/// the provider distinction had nothing left to stand on.
 ///
-/// **Ollama** (`llama3.2`, 3B, local) — both transports end up at the same 2
-/// tags. Prompt mode does provoke a recognizable small-model failure roughly
-/// half the time (the model echoes the *schema* back, nesting the data under
-/// `properties`), but that shape deserializes as neither variant of
-/// `ExtractionResult`, so it fails **loudly**: `parse_tolerant` rejects it, the
-/// prompt-based fallback re-asks, and the retry succeeds — 6 of 6 through the
-/// real pipeline. The llama.cpp grammar is not rescuing accuracy here; it is
-/// saving the round-trip.
-///
-/// So the split is not "one transport works and the other doesn't". Both work
-/// on Ollama, and only one works on OpenRouter:
-///
-/// - **OpenRouter → prompt-only.** The constrained-decoding implementation
-///   belongs to whichever endpoint routing picked; we cannot see it, test it,
-///   or be told when it changes. Its failure mode is silent, and no retry
-///   budget helps with an answer that looks correct.
-/// - **Ollama → wire-level.** One local implementation we can characterize, and
-///   it avoids a fallback round-trip on about half of calls at no measured cost
-///   to quality. Prompt-only would also be correct here, just slower.
-/// - **OpenAI-compatible → wire-level**, unmeasured: keep the status quo rather
-///   than guess.
-fn tagging_schema_enforcement(provider: &ProviderType) -> SchemaEnforcement {
-    match provider {
-        ProviderType::OpenRouter => SchemaEnforcement::PromptOnly,
-        ProviderType::Ollama | ProviderType::OpenAICompat => SchemaEnforcement::Strict,
-    }
-}
+/// So: one transport everywhere. It is required on OpenRouter, free on Ollama,
+/// and its failure mode — a reply the tolerant parser rejects, which re-asks
+/// and retries — is the one we can actually see.
+const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = SchemaEnforcement::PromptOnly;
 
 /// Output ceiling for tag extraction.
 ///
@@ -383,7 +367,7 @@ pub async fn extract_tags_from_content(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
-    .with_schema_enforcement(tagging_schema_enforcement(&provider_config.provider_type))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -421,7 +405,7 @@ pub async fn extract_tags_from_chunk(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
-    .with_schema_enforcement(tagging_schema_enforcement(&provider_config.provider_type))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -770,29 +754,17 @@ mod tests {
         (db, temp_file)
     }
 
-    /// The transport choice is provider-dependent, so pin it. Only the
-    /// OpenRouter arm is load-bearing for correctness — the others are a
-    /// round-trip optimisation and an untouched default, and a future refactor
-    /// that collapses all three into one constant would take the silent
-    /// failure back on.
+    /// Tagging must not put the schema on the wire, on any provider.
+    ///
+    /// The value is what stops the silent failure: a constrained decoder that
+    /// returns `{"tags": []}` produces a result that parses, fires no fallback,
+    /// and marks the atom tagged with nothing. The prompt-level contract fails
+    /// visibly instead, into a parser that re-asks. Reintroducing a
+    /// provider-specific exception here needs a measurement, not an intuition —
+    /// the last one cost three reversals.
     #[test]
-    fn tagging_transport_follows_the_provider() {
-        assert_eq!(
-            tagging_schema_enforcement(&ProviderType::OpenRouter),
-            SchemaEnforcement::PromptOnly,
-            "heterogeneous gateway: the decoder is unknowable and fails silently"
-        );
-        assert_eq!(
-            tagging_schema_enforcement(&ProviderType::Ollama),
-            SchemaEnforcement::Strict,
-            "prompt-only is also correct here; the grammar just avoids a \
-             fallback round-trip on ~half of calls"
-        );
-        assert_eq!(
-            tagging_schema_enforcement(&ProviderType::OpenAICompat),
-            SchemaEnforcement::Strict,
-            "unmeasured: keep the status quo rather than guessing"
-        );
+    fn tagging_never_puts_the_schema_on_the_wire() {
+        assert_eq!(TAGGING_SCHEMA_ENFORCEMENT, SchemaEnforcement::PromptOnly);
     }
 
     // ==================== Schema lint regression tests ====================
