@@ -252,26 +252,35 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
 ///
 /// Tag extraction is *generative*: the model decides how many tags to emit, so
 /// a decoder that shortens the output silently changes the answer rather than
-/// just its shape. Whether that risk outweighs the schema guarantee depends
-/// entirely on whose decoder is in the path, and the two deployments we support
-/// sit at opposite ends. Measured 2026-08-09, same content, same task:
+/// just its shape. Measured 2026-08-09, same content and task:
 ///
-/// | provider | schema on the wire | schema in the prompt |
-/// |---|---|---|
-/// | OpenRouter (`gemma-4-26b-a4b-it` → DeepInfra) | `{"tags": []}` on ~1 call in 3; counts swing 5–13 | 7–8 tags, 8 of 8 |
-/// | Ollama (`llama3.2`, 3B, local) | 2 tags, 6 of 6 | **empty on 3 of 6** |
+/// **OpenRouter** (`gemma-4-26b-a4b-it` pinned to DeepInfra) — schema on the
+/// wire returned `{"tags": []}` on 3 calls of 6, and tag counts swung 5–13 on
+/// identical input. Schema in the prompt: 4–8 tags, 8 of 8. This is the failure
+/// that matters, because it is **silent**: an empty-but-valid result parses, so
+/// no fallback fires, and the atom is recorded tagged with nothing.
 ///
-/// The inversion is the point. OpenRouter is a *heterogeneous gateway*: the
-/// constrained-decoding implementation belongs to whichever endpoint we happen
-/// to route to, we cannot see or test it, and it changes without notice — so
-/// the schema guarantee is really a dependency on the worst decoder in the
-/// pool. Ollama is one local implementation (llama.cpp grammars) paired with
-/// models small enough that instruction-following is the weaker link; there the
-/// grammar is doing real work and removing it costs half the extractions.
+/// **Ollama** (`llama3.2`, 3B, local) — both transports end up at the same 2
+/// tags. Prompt mode does provoke a recognizable small-model failure roughly
+/// half the time (the model echoes the *schema* back, nesting the data under
+/// `properties`), but that shape deserializes as neither variant of
+/// `ExtractionResult`, so it fails **loudly**: `parse_tolerant` rejects it, the
+/// prompt-based fallback re-asks, and the retry succeeds — 6 of 6 through the
+/// real pipeline. The llama.cpp grammar is not rescuing accuracy here; it is
+/// saving the round-trip.
 ///
-/// So: prompt-only where the decoder is unknowable, wire-level where it is
-/// known and the model needs the help. OpenAI-compatible servers keep the
-/// wire-level default because they are unmeasured, and that is the status quo.
+/// So the split is not "one transport works and the other doesn't". Both work
+/// on Ollama, and only one works on OpenRouter:
+///
+/// - **OpenRouter → prompt-only.** The constrained-decoding implementation
+///   belongs to whichever endpoint routing picked; we cannot see it, test it,
+///   or be told when it changes. Its failure mode is silent, and no retry
+///   budget helps with an answer that looks correct.
+/// - **Ollama → wire-level.** One local implementation we can characterize, and
+///   it avoids a fallback round-trip on about half of calls at no measured cost
+///   to quality. Prompt-only would also be correct here, just slower.
+/// - **OpenAI-compatible → wire-level**, unmeasured: keep the status quo rather
+///   than guess.
 fn tagging_schema_enforcement(provider: &ProviderType) -> SchemaEnforcement {
     match provider {
         ProviderType::OpenRouter => SchemaEnforcement::PromptOnly,
@@ -761,24 +770,23 @@ mod tests {
         (db, temp_file)
     }
 
-    /// The transport choice is provider-dependent, and the dependence runs in
-    /// *opposite* directions — that is the whole finding, so pin it. Dropping
-    /// the schema costs nothing behind a gateway whose decoder we can't see,
-    /// and costs half the extractions on a 3B local model leaning on the
-    /// grammar. A future refactor that collapses this to one constant would
-    /// silently regress one deployment or the other.
+    /// The transport choice is provider-dependent, so pin it. Only the
+    /// OpenRouter arm is load-bearing for correctness — the others are a
+    /// round-trip optimisation and an untouched default, and a future refactor
+    /// that collapses all three into one constant would take the silent
+    /// failure back on.
     #[test]
     fn tagging_transport_follows_the_provider() {
         assert_eq!(
             tagging_schema_enforcement(&ProviderType::OpenRouter),
             SchemaEnforcement::PromptOnly,
-            "heterogeneous gateway: the decoder is unknowable, so don't depend on it"
+            "heterogeneous gateway: the decoder is unknowable and fails silently"
         );
         assert_eq!(
             tagging_schema_enforcement(&ProviderType::Ollama),
             SchemaEnforcement::Strict,
-            "local llama.cpp grammar carries small models; removing it emptied \
-             3 of 6 extractions on llama3.2"
+            "prompt-only is also correct here; the grammar just avoids a \
+             fallback round-trip on ~half of calls"
         );
         assert_eq!(
             tagging_schema_enforcement(&ProviderType::OpenAICompat),
