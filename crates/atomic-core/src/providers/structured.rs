@@ -62,6 +62,38 @@ use std::sync::Arc;
 /// nowhere near it.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
+/// How a structured call asks the model for its JSON.
+///
+/// The wire-level options are not strictly better than the prompt-level one.
+/// `response_format` puts the endpoint's constrained-decoding implementation in
+/// the path, and implementations vary in quality: measured against
+/// `google/gemma-4-26b-a4b-it` on OpenRouter (2026-08-09), DeepInfra's
+/// schema-enforced endpoint returned a valid-but-**empty** `{"tags": []}` on
+/// roughly a third of calls — 8 completion tokens, `finish_reason: stop`, no
+/// error signal of any kind — where the same model given the schema in the
+/// prompt returned 7–8 tags on 8 of 8 calls. Constrained decoding took the
+/// shortest grammar-valid path instead of doing the task.
+///
+/// An empty-but-valid result is the worst failure shape available: it parses,
+/// so no fallback fires, and it reaches the caller looking like an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaEnforcement {
+    /// Wire-level `response_format` with `strict: true` — constrained decoding,
+    /// and (on OpenRouter) `provider.require_parameters` routing that narrows
+    /// the endpoint pool to those advertising support.
+    Strict,
+    /// Wire-level `response_format` without `strict`. For endpoints that reject
+    /// OpenAI strict mode but still honour the schema.
+    Lenient,
+    /// No `response_format` at all: the schema goes in the prompt and the reply
+    /// is parsed tolerantly ([`parse_tolerant`]). Trades a decoding guarantee
+    /// for the endpoint's undistorted output. The measured cost of that trade
+    /// was nil — across `openai/gpt-5-nano`, `google/gemma-4-26b-a4b-it`,
+    /// `openai/gpt-5-mini` and `z-ai/glm-5.2`, 24 of 24 prompt-mode replies
+    /// parsed directly, needing neither fence-stripping nor substring rescue.
+    PromptOnly,
+}
+
 /// A single structured-output LLM call. Construct with [`StructuredCall::new`],
 /// optionally adjust via the `with_*` methods, then pass to [`call_structured`].
 pub struct StructuredCall<'a, T> {
@@ -72,15 +104,13 @@ pub struct StructuredCall<'a, T> {
     pub schema: Value,
     pub params: GenerationParams,
     pub max_retries: usize,
-    /// Whether to request OpenAI-style strict schema enforcement. Default: `true`.
-    /// Strict mode guarantees the response adheres to the schema via
-    /// constrained decoding, but narrows the routable provider pool on
-    /// OpenRouter (since `provider.require_parameters` is also set). Opt out
-    /// with [`StructuredCall::with_strict`] when calling a model that's
-    /// known to reject strict mode (typically smaller OSS models routed via
-    /// OpenRouter or non-OpenAI backends). The linter rules + prompt-based
-    /// fallback still cover correctness when strict is off.
-    pub strict: bool,
+    /// How the schema is conveyed to the model. Default:
+    /// [`SchemaEnforcement::Strict`] — constrained decoding, which suits most
+    /// short structured calls. Callers whose task is *generative* rather than
+    /// merely shaped (tag extraction, where the model must decide how much to
+    /// produce) should consider [`SchemaEnforcement::PromptOnly`]; see that
+    /// type's documentation for the measurements behind the distinction.
+    pub enforcement: SchemaEnforcement,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -104,7 +134,7 @@ impl<'a, T> StructuredCall<'a, T> {
                 .with_temperature(0.3)
                 .with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS),
             max_retries: 2,
-            strict: true,
+            enforcement: SchemaEnforcement::Strict,
             _marker: PhantomData,
         }
     }
@@ -123,16 +153,22 @@ impl<'a, T> StructuredCall<'a, T> {
         self
     }
 
-    /// Override the strict-mode flag. Default: `true`.
-    ///
-    /// Set to `false` when the target model or provider route is known to
-    /// reject OpenAI strict schemas (e.g. OpenRouter routing to a smaller
-    /// OSS model via vLLM). The primary call still passes the schema via
-    /// `response_format`, just without the constrained-decoding guarantee —
-    /// parse failures then fall through to the prompt-based fallback path.
-    pub fn with_strict(mut self, strict: bool) -> Self {
-        self.strict = strict;
+    /// Choose how the schema reaches the model. Default:
+    /// [`SchemaEnforcement::Strict`].
+    pub fn with_schema_enforcement(mut self, enforcement: SchemaEnforcement) -> Self {
+        self.enforcement = enforcement;
         self
+    }
+
+    /// Toggle strict constrained decoding, keeping `response_format` either
+    /// way. Shorthand for [`SchemaEnforcement::Strict`] / [`SchemaEnforcement::Lenient`];
+    /// use [`Self::with_schema_enforcement`] to drop `response_format` entirely.
+    pub fn with_strict(self, strict: bool) -> Self {
+        self.with_schema_enforcement(if strict {
+            SchemaEnforcement::Strict
+        } else {
+            SchemaEnforcement::Lenient
+        })
     }
 }
 
@@ -207,6 +243,16 @@ fn early_end_reason(response: &CompletionResponse) -> Option<&str> {
         .or_else(|| response.native_finish_reason.as_deref().filter(|r| is_cut(r)))
 }
 
+/// The prompt-level statement of the output contract, used both as the primary
+/// instruction under [`SchemaEnforcement::PromptOnly`] and as the re-ask in the
+/// fallback. One wording, so the two paths cannot drift apart.
+fn schema_instruction(schema_str: &str) -> String {
+    format!(
+        "Reply with ONLY a single JSON object matching this schema. No markdown, \
+         no prose, no code fences, no surrounding text.\n\nSchema:\n{schema_str}"
+    )
+}
+
 /// Run a structured-output call against the configured provider. See the
 /// module-level docs for the full semantics.
 ///
@@ -252,7 +298,7 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         schema,
         params,
         max_retries,
-        strict,
+        enforcement,
         ..
     } = call;
 
@@ -274,17 +320,32 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
 
     let schema_str = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
 
-    // Primary attempt: with structured output enabled. Strict defaults to
-    // true but callers can opt out via `StructuredCall::with_strict(false)`
-    // for models that reject OpenAI strict mode.
-    let schema_wrapper = StructuredOutputSchema {
-        name: schema_name.to_string(),
-        schema: schema.clone(),
-        strict,
+    // Primary attempt. Either the schema rides on the wire as
+    // `response_format`, or it rides in the prompt and we parse tolerantly —
+    // see `SchemaEnforcement` for why the latter is sometimes the better
+    // trade.
+    let (primary_config, primary_messages) = match enforcement {
+        SchemaEnforcement::Strict | SchemaEnforcement::Lenient => {
+            let schema_wrapper = StructuredOutputSchema {
+                name: schema_name.to_string(),
+                schema: schema.clone(),
+                strict: enforcement == SchemaEnforcement::Strict,
+            };
+            (
+                LlmConfig::new(model.to_string())
+                    .with_params(params.clone().with_structured_output(schema_wrapper)),
+                messages.to_vec(),
+            )
+        }
+        SchemaEnforcement::PromptOnly => {
+            let mut prompted = messages.to_vec();
+            prompted.push(Message::user(schema_instruction(&schema_str)));
+            (
+                LlmConfig::new(model.to_string()).with_params(params.clone()),
+                prompted,
+            )
+        }
     };
-    let primary_config = LlmConfig::new(model.to_string())
-        .with_params(params.clone().with_structured_output(schema_wrapper));
-    let primary_messages = messages.to_vec();
 
     let mut last_preview = String::new();
     let mut last_parse_err = String::new();
@@ -386,15 +447,14 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         }
     }
 
-    // Prompt-based fallback: no schema, explicit user nudge. This handles the
-    // case where the provider silently ignored `response_format` (some weaker
-    // OpenRouter-routed models, some Ollama models) and returned prose or
-    // fenced JSON that the primary attempt couldn't cleanly parse.
+    // Prompt-based fallback: no schema on the wire, explicit user nudge. This
+    // handles the case where the provider silently ignored `response_format`
+    // (some weaker OpenRouter-routed models, some Ollama models) and returned
+    // prose or fenced JSON that the primary attempt couldn't cleanly parse.
+    // Reached from `PromptOnly` too, where it re-asks with the sharper wording.
     let nudge = format!(
-        "Your previous response could not be parsed. Reply with ONLY a single JSON \
-         object matching this schema. No markdown, no prose, no code fences, no \
-         surrounding text.\n\nSchema:\n{}",
-        schema_str
+        "Your previous response could not be parsed. {}",
+        schema_instruction(&schema_str)
     );
 
     let mut fallback_messages = messages.to_vec();
@@ -486,8 +546,14 @@ const LONG_FORM_TRAILER: &str = "CITATIONS_USED:";
 /// structural completeness check — a generation that lost its tail is
 /// missing the trailer and fails loudly into the retry below, instead of
 /// being stored as a stub. Short structured calls (tagging, extraction,
-/// section ops) should keep [`call_structured`]: their outputs are small
-/// and genuinely benefit from constrained decoding.
+/// section ops) keep [`call_structured`]: their outputs are small and the
+/// JSON envelope costs nothing there.
+///
+/// Note that "keep `call_structured`" is not the same as "keep constrained
+/// decoding" — see [`SchemaEnforcement`]. Measurement has since shown the
+/// wire-level `response_format` layer degrading *generative* short calls on
+/// some endpoints (tag extraction collapsing to an empty list), so
+/// `call_structured` now carries the choice explicitly.
 pub async fn call_long_form_markdown(
     provider_config: &ProviderConfig,
     model: &str,
@@ -1450,7 +1516,7 @@ mod tests {
     // ==================== Strict-mode escape hatch ====================
 
     #[test]
-    fn structured_call_default_strict_is_true() {
+    fn structured_call_defaults_to_strict_enforcement() {
         let config = test_provider_config();
         let messages: Vec<Message> = vec![];
         let call = StructuredCall::<Sample>::new(
@@ -1460,22 +1526,23 @@ mod tests {
             "sample_result",
             sample_schema(),
         );
-        assert!(call.strict, "default strict must be true");
+        assert_eq!(call.enforcement, SchemaEnforcement::Strict);
     }
 
+    /// `with_strict` stays a shorthand over the two wire-level modes; it must
+    /// never reach `PromptOnly`, which is a different transport, not a
+    /// loosening of this one.
     #[test]
-    fn with_strict_false_sets_field() {
+    fn with_strict_maps_onto_the_wire_level_modes() {
         let config = test_provider_config();
         let messages: Vec<Message> = vec![];
-        let call = StructuredCall::<Sample>::new(
-            &config,
-            "m",
-            &messages,
-            "sample_result",
-            sample_schema(),
-        )
-        .with_strict(false);
-        assert!(!call.strict);
+        let build = |strict: bool| {
+            StructuredCall::<Sample>::new(&config, "m", &messages, "sample_result", sample_schema())
+                .with_strict(strict)
+                .enforcement
+        };
+        assert_eq!(build(false), SchemaEnforcement::Lenient);
+        assert_eq!(build(true), SchemaEnforcement::Strict);
     }
 
     #[tokio::test]
@@ -1519,6 +1586,76 @@ mod tests {
             !primary.strict,
             "with_strict(false) must propagate to the outbound request"
         );
+    }
+
+    /// `PromptOnly` must put nothing on the wire and everything in the prompt.
+    /// The wire half is the point: a `response_format` that reaches a weak
+    /// constrained-decoding endpoint is what collapsed tag extraction to an
+    /// empty list.
+    #[tokio::test]
+    async fn prompt_only_sends_no_response_format_and_states_the_schema() {
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response(OK_JSON);
+
+        let config = test_provider_config();
+        let messages = vec![Message::user("tag this")];
+        let call = StructuredCall::<Sample>::new(
+            &config,
+            "m",
+            &messages,
+            "sample_result",
+            sample_schema(),
+        )
+        .with_schema_enforcement(SchemaEnforcement::PromptOnly);
+        call_structured_with_provider::<Sample>(call, provider.clone())
+            .await
+            .expect("a directly parseable reply needs no fallback");
+
+        let schemas = provider.captured_schemas();
+        assert_eq!(schemas.len(), 1, "one call, no fallback");
+        assert!(
+            schemas[0].is_none(),
+            "PromptOnly must not send response_format"
+        );
+
+        let sent = provider.captured_messages();
+        let last = sent[0].last().expect("an instruction is appended");
+        let text = last.content.as_deref().expect("instruction has content");
+        assert!(text.contains("ONLY a single JSON object"), "{text}");
+        assert!(
+            text.contains("\"count\""),
+            "the schema itself must reach the model: {text}"
+        );
+        assert!(
+            !text.contains("could not be parsed"),
+            "the primary instruction must not claim a prior failure: {text}"
+        );
+    }
+
+    /// A reply wrapped in prose or fences is exactly what dropping
+    /// `response_format` risks, so the tolerant parser must absorb it without
+    /// spending the fallback call.
+    #[tokio::test]
+    async fn prompt_only_tolerates_a_fenced_reply() {
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response(format!("Here you go:\n\n```json\n{OK_JSON}\n```"));
+
+        let config = test_provider_config();
+        let messages = vec![Message::user("tag this")];
+        let call = StructuredCall::<Sample>::new(
+            &config,
+            "m",
+            &messages,
+            "sample_result",
+            sample_schema(),
+        )
+        .with_schema_enforcement(SchemaEnforcement::PromptOnly);
+
+        let out = call_structured_with_provider::<Sample>(call, provider.clone())
+            .await
+            .expect("fenced JSON must parse tolerantly");
+        assert_eq!(out.count, 7);
+        assert_eq!(provider.call_count(), 1, "no fallback call needed");
     }
 
     #[tokio::test]

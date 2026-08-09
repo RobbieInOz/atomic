@@ -2,7 +2,7 @@
 //!
 //! This module handles automatic tag extraction from atom content.
 
-use crate::providers::structured::{call_structured, StructuredCall};
+use crate::providers::structured::{call_structured, SchemaEnforcement, StructuredCall};
 use crate::providers::types::{GenerationParams, Message};
 use crate::providers::ProviderConfig;
 use rusqlite::Connection;
@@ -251,6 +251,30 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
 /// (tag-picking is nearly deterministic), reasoning minimized, optional
 /// `supported_params` threaded through so we don't send fields the router's
 /// downstream provider doesn't accept.
+/// How the tagging schema reaches the model.
+///
+/// Tag extraction is *generative*: the model decides how many tags to emit, so
+/// a decoder that shortens the output silently changes the answer rather than
+/// just its shape. Wire-level `response_format` does exactly that on some
+/// OpenRouter endpoints — measured 2026-08-09 on `google/gemma-4-26b-a4b-it`,
+/// DeepInfra's schema-enforced endpoint returned `{"tags": []}` (8 completion
+/// tokens, `finish_reason: stop`, no error signal) on ~1 call in 3, and
+/// schema-mode tag counts swung 5–13 on identical input. The same content sent
+/// with the schema in the prompt returned 7–8 tags on 8 of 8 calls.
+///
+/// The trade is a decoding guarantee for a tolerant parser, and the parser was
+/// measured never to be exercised: across `openai/gpt-5-nano`,
+/// `google/gemma-4-26b-a4b-it`, `openai/gpt-5-mini` and `z-ai/glm-5.2`, all 24
+/// prompt-mode replies parsed directly — no fences, no surrounding prose.
+/// Prompt mode also matched or beat schema mode on tag count for three of the
+/// four models, and was consistently less erratic.
+///
+/// An empty-but-valid extraction is the failure this avoids: it parses, so the
+/// prompt-based fallback in `call_structured` never fires, and it reaches the
+/// pipeline looking like a real answer — the atom is then recorded as tagged
+/// with nothing.
+const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = SchemaEnforcement::PromptOnly;
+
 /// Output ceiling for tag extraction.
 ///
 /// A tag list is a few hundred tokens, but reasoning models spend completion
@@ -342,6 +366,7 @@ pub async fn extract_tags_from_content(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -379,6 +404,7 @@ pub async fn extract_tags_from_chunk(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -699,6 +725,9 @@ pub async fn consolidate_atom_tags(
         "consolidation_result",
         consolidation_schema(),
     )
+    // Left on the default (constrained decoding) deliberately: the empty-list
+    // degradation was measured for tag *extraction*, not for consolidation,
+    // whose prompt and output shape differ. Worth measuring before moving it.
     .with_params(extraction_params(supported_params))
     .with_max_retries(3);
 

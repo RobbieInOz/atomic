@@ -956,9 +956,21 @@ impl Respond for ChatResponder {
             return with_delay(response);
         }
 
+        // Schema-less requests are routed by sniffing the schema JSON that the
+        // caller stated in the prompt. Two paths arrive this way: the
+        // prompt-based fallback, and callers that deliberately keep
+        // `response_format` off the wire entirely (tag extraction — see
+        // `SchemaEnforcement::PromptOnly`). Distinctive property names are the
+        // discriminator, so order matters where schemas overlap: the
+        // consolidation schema also carries `parent_name`, and must be tested
+        // before the extraction arm claims it.
         let schema_name = wire_schema.unwrap_or_else(|| {
             if request_text.contains("after_heading") {
                 "wiki_update_section_ops".to_string()
+            } else if request_text.contains("tags_to_remove") {
+                "consolidation_result".to_string()
+            } else if request_text.contains("parent_name") {
+                "extraction_result".to_string()
             } else {
                 String::new()
             }
