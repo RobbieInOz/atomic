@@ -2,6 +2,12 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.45.0 — 2026-08-09
+
+- Fix auto-tagging, tag merges, and wiki updates silently producing empty results on certain AI providers by moving generative structured calls to prompt-level schema enforcement
+- Fix gateway-padded 200 responses (common on OpenRouter) being classified as permanent failures instead of retryable errors, which caused auto-tagging to waste retry budget and drop atoms
+- Improve structured output instructions with concrete examples derived from the schema, significantly improving reliability on smaller local models (e.g. llama3.2)
+
 ## v1.44.0 — 2026-08-08
 
 - Add per-tag wiki prompt overrides — customize the generation and update instructions for any tag's wiki article via the tag context menu, wiki card actions, or the reader header
