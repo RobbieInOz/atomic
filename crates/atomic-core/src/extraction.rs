@@ -4,7 +4,7 @@
 
 use crate::providers::structured::{call_structured, SchemaEnforcement, StructuredCall};
 use crate::providers::types::{GenerationParams, Message};
-use crate::providers::ProviderConfig;
+use crate::providers::{ProviderConfig, ProviderType};
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::sync::{LazyLock, Mutex};
@@ -247,33 +247,37 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
     })
 }
 
-/// Build the shared generation params for extraction calls. Temperature 0.1
-/// (tag-picking is nearly deterministic), reasoning minimized, optional
-/// `supported_params` threaded through so we don't send fields the router's
-/// downstream provider doesn't accept.
-/// How the tagging schema reaches the model.
+/// How the tagging schema reaches the model — a property of the **provider**,
+/// not of the task alone.
 ///
 /// Tag extraction is *generative*: the model decides how many tags to emit, so
 /// a decoder that shortens the output silently changes the answer rather than
-/// just its shape. Wire-level `response_format` does exactly that on some
-/// OpenRouter endpoints — measured 2026-08-09 on `google/gemma-4-26b-a4b-it`,
-/// DeepInfra's schema-enforced endpoint returned `{"tags": []}` (8 completion
-/// tokens, `finish_reason: stop`, no error signal) on ~1 call in 3, and
-/// schema-mode tag counts swung 5–13 on identical input. The same content sent
-/// with the schema in the prompt returned 7–8 tags on 8 of 8 calls.
+/// just its shape. Whether that risk outweighs the schema guarantee depends
+/// entirely on whose decoder is in the path, and the two deployments we support
+/// sit at opposite ends. Measured 2026-08-09, same content, same task:
 ///
-/// The trade is a decoding guarantee for a tolerant parser, and the parser was
-/// measured never to be exercised: across `openai/gpt-5-nano`,
-/// `google/gemma-4-26b-a4b-it`, `openai/gpt-5-mini` and `z-ai/glm-5.2`, all 24
-/// prompt-mode replies parsed directly — no fences, no surrounding prose.
-/// Prompt mode also matched or beat schema mode on tag count for three of the
-/// four models, and was consistently less erratic.
+/// | provider | schema on the wire | schema in the prompt |
+/// |---|---|---|
+/// | OpenRouter (`gemma-4-26b-a4b-it` → DeepInfra) | `{"tags": []}` on ~1 call in 3; counts swing 5–13 | 7–8 tags, 8 of 8 |
+/// | Ollama (`llama3.2`, 3B, local) | 2 tags, 6 of 6 | **empty on 3 of 6** |
 ///
-/// An empty-but-valid extraction is the failure this avoids: it parses, so the
-/// prompt-based fallback in `call_structured` never fires, and it reaches the
-/// pipeline looking like a real answer — the atom is then recorded as tagged
-/// with nothing.
-const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = SchemaEnforcement::PromptOnly;
+/// The inversion is the point. OpenRouter is a *heterogeneous gateway*: the
+/// constrained-decoding implementation belongs to whichever endpoint we happen
+/// to route to, we cannot see or test it, and it changes without notice — so
+/// the schema guarantee is really a dependency on the worst decoder in the
+/// pool. Ollama is one local implementation (llama.cpp grammars) paired with
+/// models small enough that instruction-following is the weaker link; there the
+/// grammar is doing real work and removing it costs half the extractions.
+///
+/// So: prompt-only where the decoder is unknowable, wire-level where it is
+/// known and the model needs the help. OpenAI-compatible servers keep the
+/// wire-level default because they are unmeasured, and that is the status quo.
+fn tagging_schema_enforcement(provider: &ProviderType) -> SchemaEnforcement {
+    match provider {
+        ProviderType::OpenRouter => SchemaEnforcement::PromptOnly,
+        ProviderType::Ollama | ProviderType::OpenAICompat => SchemaEnforcement::Strict,
+    }
+}
 
 /// Output ceiling for tag extraction.
 ///
@@ -288,6 +292,10 @@ const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = SchemaEnforcement::PromptO
 /// the pool intact with ~2.6x headroom over the worst generation seen.
 const TAGGING_MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// Build the shared generation params for extraction calls. Temperature 0.1
+/// (tag-picking is nearly deterministic), reasoning minimized, optional
+/// `supported_params` threaded through so we don't send fields the router's
+/// downstream provider doesn't accept.
 fn extraction_params(supported_params: Option<Vec<String>>) -> GenerationParams {
     let mut params = GenerationParams::new()
         .with_temperature(0.1)
@@ -366,7 +374,7 @@ pub async fn extract_tags_from_content(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
-    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
+    .with_schema_enforcement(tagging_schema_enforcement(&provider_config.provider_type))
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -404,7 +412,7 @@ pub async fn extract_tags_from_chunk(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
-    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
+    .with_schema_enforcement(tagging_schema_enforcement(&provider_config.provider_type))
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -751,6 +759,32 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db = Database::open_or_create(temp_file.path()).unwrap();
         (db, temp_file)
+    }
+
+    /// The transport choice is provider-dependent, and the dependence runs in
+    /// *opposite* directions — that is the whole finding, so pin it. Dropping
+    /// the schema costs nothing behind a gateway whose decoder we can't see,
+    /// and costs half the extractions on a 3B local model leaning on the
+    /// grammar. A future refactor that collapses this to one constant would
+    /// silently regress one deployment or the other.
+    #[test]
+    fn tagging_transport_follows_the_provider() {
+        assert_eq!(
+            tagging_schema_enforcement(&ProviderType::OpenRouter),
+            SchemaEnforcement::PromptOnly,
+            "heterogeneous gateway: the decoder is unknowable, so don't depend on it"
+        );
+        assert_eq!(
+            tagging_schema_enforcement(&ProviderType::Ollama),
+            SchemaEnforcement::Strict,
+            "local llama.cpp grammar carries small models; removing it emptied \
+             3 of 6 extractions on llama3.2"
+        );
+        assert_eq!(
+            tagging_schema_enforcement(&ProviderType::OpenAICompat),
+            SchemaEnforcement::Strict,
+            "unmeasured: keep the status quo rather than guessing"
+        );
     }
 
     // ==================== Schema lint regression tests ====================
