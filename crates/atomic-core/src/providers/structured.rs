@@ -256,6 +256,22 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         ..
     } = call;
 
+    // Guarantee an output cap. `StructuredCall::new` sets one, but
+    // `with_params` replaces the params struct wholesale, so any caller that
+    // builds its own `GenerationParams` silently drops it — tag extraction
+    // did exactly that, and an absent `max_tokens` is the harmful direction:
+    // it hands the ceiling to whatever default the router or upstream picks,
+    // and it changes *routing* (OpenRouter filters endpoints by their
+    // `max_completion_tokens`, so sending nothing widens the pool while
+    // sending 32k can narrow it to none). Callers with a smaller natural
+    // ceiling should set it explicitly; forgetting entirely must not be an
+    // option.
+    let params = if params.max_tokens.is_some() {
+        params
+    } else {
+        params.with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS)
+    };
+
     let schema_str = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
 
     // Primary attempt: with structured output enabled. Strict defaults to

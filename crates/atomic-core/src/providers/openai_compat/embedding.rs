@@ -47,6 +47,8 @@ pub async fn embed_batch(
 
     let response = req.json(&request).send().await?;
 
+    let trace_id = crate::providers::error::gateway_trace_id(response.headers());
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let retry_after = response
@@ -57,13 +59,13 @@ pub async fn embed_batch(
         let body = response.text().await.unwrap_or_default();
 
         if status == 429 {
-            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 200), "OpenAI-compat embedding rate limited");
+            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 200), "OpenAI-compat embedding rate limited");
             return Err(ProviderError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
 
-        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenAI-compat embedding API error");
+        tracing::error!(status, model = %config.model, request_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenAI-compat embedding API error");
         return Err(ProviderError::Api {
             status,
             message: body,
@@ -74,8 +76,8 @@ pub async fn embed_batch(
 
     let embedding_response: EmbeddingResponse = serde_json::from_str(&body)
         .map_err(|e| {
-            tracing::error!(error = %e, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenAI-compat embedding parse error");
-            ProviderError::ParseError(format!("Failed to parse embedding response: {e}"))
+            tracing::error!(error = %e, model = %config.model, request_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenAI-compat embedding response decode failed");
+            crate::providers::error::decode_error("embedding response", &body, &e, trace_id.as_deref())
         })?;
 
     Ok(embedding_response

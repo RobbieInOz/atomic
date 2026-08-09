@@ -47,21 +47,6 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-/// OpenRouter may return HTTP 200 with an error body when the upstream provider
-/// fails after OpenRouter has started proxying the request.
-#[derive(Deserialize)]
-struct OpenRouterErrorResponse {
-    error: OpenRouterErrorDetail,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterErrorDetail {
-    #[serde(default)]
-    code: Option<serde_json::Value>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
 /// Generate embeddings for multiple texts via OpenRouter API
 pub async fn embed_batch(
     provider: &OpenRouterProvider,
@@ -90,6 +75,8 @@ pub async fn embed_batch(
         .send()
         .await?;
 
+    let trace_id = crate::providers::error::gateway_trace_id(response.headers());
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let retry_after = response
@@ -100,13 +87,13 @@ pub async fn embed_batch(
         let body = response.text().await.unwrap_or_default();
 
         if status == 429 {
-            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 200), "OpenRouter embedding rate limited");
+            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 200), "OpenRouter embedding rate limited");
             return Err(ProviderError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
 
-        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenRouter embedding API error");
+        tracing::error!(status, model = %config.model, generation_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenRouter embedding API error");
         return Err(ProviderError::Api {
             status,
             message: body,
@@ -118,20 +105,12 @@ pub async fn embed_batch(
     // OpenRouter can return HTTP 200 with an error body when the upstream
     // provider fails after proxying has started. Check for this before
     // trying to parse as a successful embedding response.
-    if let Ok(err_resp) = serde_json::from_str::<OpenRouterErrorResponse>(&body) {
-        let message = err_resp
-            .error
-            .message
-            .unwrap_or_else(|| "Unknown upstream error".to_string());
-        let code = err_resp
-            .error
-            .code
-            .map(|c| c.to_string())
-            .unwrap_or_default();
+    if let Some((code, message)) = super::upstream_error(&body) {
         tracing::error!(
             model = %config.model,
             error_code = %code,
             error_message = %message,
+            generation_id = trace_id.as_deref().unwrap_or("-"),
             "OpenRouter returned 200 with error body (upstream provider failure)"
         );
         // Always treat as 502 (upstream failure) so the adaptive retry
@@ -145,8 +124,8 @@ pub async fn embed_batch(
 
     let embedding_response: EmbeddingResponse = serde_json::from_str(&body)
         .map_err(|e| {
-            tracing::error!(error = %e, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenRouter embedding parse error");
-            ProviderError::ParseError(format!("Failed to parse embedding response: {e}"))
+            tracing::error!(error = %e, model = %config.model, generation_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenRouter embedding response decode failed");
+            crate::providers::error::decode_error("embedding response", &body, &e, trace_id.as_deref())
         })?;
 
     let mut vectors: Vec<Vec<f32>> = embedding_response

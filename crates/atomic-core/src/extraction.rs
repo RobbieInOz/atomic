@@ -251,9 +251,23 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
 /// (tag-picking is nearly deterministic), reasoning minimized, optional
 /// `supported_params` threaded through so we don't send fields the router's
 /// downstream provider doesn't accept.
+/// Output ceiling for tag extraction.
+///
+/// A tag list is a few hundred tokens, but reasoning models spend completion
+/// tokens thinking before emitting the JSON — a field failure was observed at
+/// 3091 completion tokens for 300 characters of tags — so the cap has to clear
+/// that comfortably. It is deliberately far below
+/// [`DEFAULT_MAX_OUTPUT_TOKENS`]: OpenRouter routes only to endpoints whose
+/// `max_completion_tokens` covers the request, and 32k prunes real endpoints
+/// from the pool (`google/gemma-4-26b-a4b-it` on DeepInfra caps at 16384 and
+/// drops out entirely, taking the request to a 404 when pinned). 8192 keeps
+/// the pool intact with ~2.6x headroom over the worst generation seen.
+const TAGGING_MAX_OUTPUT_TOKENS: u32 = 8192;
+
 fn extraction_params(supported_params: Option<Vec<String>>) -> GenerationParams {
     let mut params = GenerationParams::new()
         .with_temperature(0.1)
+        .with_max_tokens(TAGGING_MAX_OUTPUT_TOKENS)
         .with_minimize_reasoning(true);
     if let Some(supported) = supported_params {
         params = params.with_supported_parameters(supported);
