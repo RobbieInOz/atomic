@@ -1,68 +1,22 @@
-//! Regression cover for the 2026-08-09 auto-tagging failure on
-//! `google/gemma-4-26b-a4b-it`:
+//! Regression cover for a 2026-08-09 auto-tagging failure that surfaced as
+//! `EOF while parsing a value at line 233 column 0` with a blank body preview.
 //!
-//! ```text
-//! INFO  Starting auto-tagging atom_id=7922b646… model=google/gemma-4-26b-a4b-it   [15:00:19.103]
-//! ERROR OpenRouter LLM parse error error=EOF while parsing a value at line 233
-//!       column 0 model=google/gemma-4-26b-a4b-it body_preview=                    [15:01:08.232]
-//! ```
+//! OpenRouter commits `200 OK` before the upstream produces anything, then
+//! keeps the connection alive with JSON whitespace ([`PADDING_UNIT`], captured
+//! verbatim; the payload that follows is compact, so every line in that serde
+//! error was padding). After the status is committed a late failure can't be
+//! reported as 5xx, so the gateway ends the body instead — and the client is
+//! left with a complete, well-formed 200 containing nothing.
 //!
-//! ## What the wire actually carries
+//! Whether that arrives as `Network` (stream cut) or `ParseError` (stream
+//! ended cleanly) turns only on the terminating chunk. Treating the second as
+//! permanent is what dropped the work. Both are transport failures now.
 //!
-//! Verified against live OpenRouter traffic (2026-08-09, this exact model and
-//! the exact request the tagging path builds):
-//!
-//! - OpenRouter pads **non-streaming** `/chat/completions` responses with
-//!   whitespace while it waits on the upstream. The unit is
-//!   [`PADDING_UNIT`] — captured verbatim; the body's only byte values are
-//!   `0x0a` and `0x20`. Padding appeared on **every** observed call (6–112
-//!   newlines).
-//! - The real JSON payload that follows is **compact — zero newlines**.
-//!   Therefore every line counted in a serde error on this path came from
-//!   padding, and nothing else. `line 233` means 232 padding newlines.
-//! - The cadence is [`PADDING_NEWLINES_PER_SEC`] ≈ 4.66/s, stable across
-//!   calls from 4.5s to 8 minutes. 232 newlines ⇒ ~49.8s of waiting; the
-//!   report's own timestamps span 49.13s. The body shape and the wall-clock
-//!   agree independently.
-//! - When a call goes wrong, padding is *all* that ever arrives: one captured
-//!   call ran 8 minutes and delivered 12288 bytes / 2235 newlines / no JSON.
-//!
-//! ## Why the gateway can only fail this way
-//!
-//! OpenRouter commits `HTTP/2 200` and sends headers *before* the upstream has
-//! produced anything (verified: a request cut after 3s had already returned
-//! full headers and a body of nothing but padding). After that commit no
-//! failure can be expressed as an HTTP status — the only exits are a JSON
-//! error body or simply ending the body. Ending it leaves the client holding
-//! whitespace. So *any* late fault, on *any* upstream, degrades into this
-//! shape. It is a property of the gateway, not of one provider.
-//!
-//! Note what the failing body does NOT contain: a `provider` field. The
-//! upstream that served a failed call is therefore unknowable from the
-//! response — but `x-generation-id` is in the *headers*, arrives before the
-//! body, and resolves via `GET /api/v1/generation?id=…` to the provider,
-//! timings, finish reason, and cost. It is now captured into the error and
-//! the log line (`providers::error::gateway_trace_id`).
-//!
-//! ## What these tests hold in place
-//!
-//! Both errors in the report are the same event, differing only in whether
-//! the terminating chunk arrived: `Network` ("error decoding response body",
-//! stream cut) or `ParseError` ("EOF while parsing a value", stream ended on
-//! padding). Classifying the second as permanent is what dropped the work —
-//! one attempt of a three-attempt budget, on a fault a retry fixes. Both are
-//! now transport failures, retryable and `Transient`.
-//!
-//! Worth knowing when reading a future report: OpenRouter records these as
-//! **successes**. Three deliberately abandoned calls came back
-//! `finish_reason: stop`, `cancelled: false`, fully billed — delivery is not
-//! modelled in a generation record, so the client seeing nothing leaves no
-//! trace on their side. An absence of errors in their dashboard is consistent
-//! with this failure, not evidence against it.
-//!
-//! What is NOT established: what tipped that particular request over. The
-//! report's `upstream_provider="DeepInfra"` belongs to the *previous,
-//! successful* call for a different atom, not to the failure.
+//! Two things worth knowing before re-diagnosing this: OpenRouter records
+//! these as billed successes, so an absence of errors in their dashboard is
+//! consistent with the failure rather than evidence against it; and the
+//! failing body carries no `provider` field, so the upstream is unknowable
+//! from the response alone — hence capturing `x-generation-id`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -307,14 +261,11 @@ async fn padded_body_is_a_retryable_transport_failure() {
 }
 
 /// One event, two framings — cut mid-stream, or ended politely on padding.
-/// Both of the report's error lines are this. Neither may be permanent.
+/// Neither may be permanent.
 ///
-/// This is also where "why not just wait for the body?" is answered: we *do*
-/// wait. In the terminated case the wait **succeeded** — reqwest read the
-/// message to completion and handed us the whole body. That the body was
-/// whitespace is not something more waiting fixes; the server already said
-/// "that's all". Waiting is only meaningful while a stream is open, and
-/// neither of these is.
+/// Also answers "why not just wait for the body?": in the terminated case the
+/// wait *succeeded*. We read the whole message; it was whitespace. More
+/// waiting can't fix a stream the server already closed.
 #[tokio::test]
 async fn both_framings_of_a_delivered_nothing_are_retryable() {
     let cut = RawServer::start(cut_mid_body_response()).await;
@@ -401,17 +352,10 @@ async fn a_padded_first_attempt_now_recovers_on_retry() {
     );
 }
 
-/// Separate defect found while reproducing the above: the tagging path sent
-/// **no `max_tokens`**. `StructuredCall::new` sets a default, then
-/// `with_params(extraction_params())` replaced the whole struct and dropped it
-/// — the exact hazard `openrouter/llm.rs` warns about.
-///
-/// Not cosmetic: it changes *routing*. Live check on
-/// `google/gemma-4-26b-a4b-it` — with `max_tokens: 32000` OpenRouter returns
-/// 404 "No endpoints found" for DeepInfra (its endpoint caps completions at
-/// 16384); with the field omitted, DeepInfra serves the call and the ceiling
-/// becomes whatever the upstream picks. A cap must always be sent, and for
-/// tagging it must be small enough to keep the endpoint pool intact.
+/// The tagging path used to send no `max_tokens` at all — `with_params`
+/// replaced the struct that carried the default. Not cosmetic: OpenRouter
+/// filters endpoints by `max_completion_tokens`, so an absent cap silently
+/// widens the routable pool and an oversized one empties it.
 #[tokio::test]
 async fn every_structured_call_sends_an_output_cap() {
     let config = ProviderConfig::from_settings(&Default::default());

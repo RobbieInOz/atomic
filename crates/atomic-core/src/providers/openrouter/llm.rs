@@ -676,13 +676,10 @@ async fn complete_streaming_internal(
         }
     }
 
-    // A stream that carried no payload and no terminator delivered nothing at
-    // all — the streaming face of a gateway that committed 200 and then ended
-    // the body on padding. Returning `Ok` here would hand back an empty
-    // completion that looks like a model choosing to say nothing, and the
-    // caller would persist that silence as a result. Fail transiently instead,
-    // matching the non-streaming path; errors return before `Done` is emitted,
-    // as every earlier bail in this function does.
+    // No payload and no terminator means the stream delivered nothing. `Ok`
+    // here would look like a model choosing to say nothing, and the caller
+    // would persist that silence. Errors return before `Done` is emitted, as
+    // every earlier bail in this function does.
     if !saw_payload && !done_emitted {
         tracing::error!(
             model = %config.model,

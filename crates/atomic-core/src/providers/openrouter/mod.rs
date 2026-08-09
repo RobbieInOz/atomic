@@ -28,19 +28,12 @@ struct ErrorEnvelopeDetail {
     message: Option<String>,
 }
 
-/// Recover an upstream failure that the gateway wrote into a **200** body.
-///
-/// OpenRouter commits its status line before the upstream has produced
-/// anything, so a failure discovered afterwards cannot be reported as 5xx
-/// (see `providers::error::decode_error`). Writing an error object in place
-/// of the payload is one of the two exits left to it; ending the body
-/// mid-padding is the other.
-///
-/// Returns `(code, message)` when the body is an error envelope rather than a
-/// payload. Both the chat and embedding paths need this: their response types
-/// require a `choices`/`data` field, so an unrecognized error envelope would
-/// otherwise surface as a *permanent* parse failure and the work would be
-/// dropped rather than retried.
+/// Recover an upstream failure the gateway wrote into a **200** body, as
+/// `(code, message)`. OpenRouter commits its status before the upstream
+/// produces anything, so a later failure can only be an error object or a
+/// truncated body (see `providers::error::decode_error`). Both the chat and
+/// embedding response types require a payload field, so an unrecognised
+/// envelope would otherwise look like a permanent parse failure.
 fn upstream_error(body: &str) -> Option<(String, String)> {
     let envelope: ErrorEnvelope = serde_json::from_str(body).ok()?;
     Some((

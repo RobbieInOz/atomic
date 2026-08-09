@@ -313,15 +313,10 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// The gateway's own identifier for a request, when it sends one.
-///
-/// OpenRouter returns `x-generation-id` **in the response headers**, which
-/// arrive long before the body — so it survives exactly the failures where
-/// the body doesn't, and resolves via `GET /api/v1/generation?id=…` to the
-/// upstream provider, timings, finish reason, and cost. It is the only
-/// thread back to what actually happened on a call that delivered nothing.
-/// `x-request-id` is the common spelling among other OpenAI-compatible
-/// gateways.
+/// The gateway's id for a request. Lives in the headers, which arrive before
+/// the body — so it survives the failures where the body doesn't, and resolves
+/// via `GET /api/v1/generation?id=…` to provider, timings, finish reason and
+/// cost. Often the only thread back to a call that delivered nothing.
 pub fn gateway_trace_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     ["x-generation-id", "x-request-id"]
         .iter()
@@ -330,14 +325,10 @@ pub fn gateway_trace_id(headers: &reqwest::header::HeaderMap) -> Option<String> 
         .map(str::to_string)
 }
 
-/// Render a response body for a log line.
-///
-/// Never emit a body raw. Gateways pad responses with insignificant JSON
-/// whitespace (see [`decode_error`]), and a raw preview of one prints as an
-/// empty field followed by a few hundred newlines dumped into the log
-/// stream — the diagnostic goes blank at exactly the moment the body is the
-/// thing you need to see. Whitespace-only bodies are therefore described
-/// rather than shown, and everything else is escaped.
+/// Render a response body for a log line. Never raw: a padded body (see
+/// [`decode_error`]) prints as an empty field plus a few hundred newlines
+/// dumped into the log, so the diagnostic goes blank exactly when the body is
+/// what you need. Whitespace bodies are described; everything else is escaped.
 pub fn body_for_log(body: &str, max_bytes: usize) -> String {
     if body.is_empty() {
         return "<empty body>".to_string();
@@ -352,29 +343,18 @@ pub fn body_for_log(body: &str, max_bytes: usize) -> String {
     format!("{:?}", truncate_utf8(body, max_bytes))
 }
 
-/// Classify a 2xx response body that would not deserialize.
+/// Classify a 2xx body that would not deserialize.
 ///
-/// A gateway fronting a slow upstream commits `200 OK` **before** the work is
-/// done — it must return a response object immediately — and then holds the
-/// connection open with insignificant JSON whitespace (OpenRouter writes a
-/// newline-and-spaces heartbeat every ~425ms, legal because RFC 8259 permits
-/// arbitrary whitespace before the top-level value, so a compliant parser
-/// cannot see it). Once that status is committed it cannot be retracted: a
-/// late failure can no longer be expressed as 502 or 504. The gateway's only
-/// remaining exits are to write an error object into the body, or to stop
-/// writing and end the stream.
+/// OpenRouter commits `200 OK` before the upstream produces anything, then
+/// holds the connection open with JSON whitespace (invisible to a parser, per
+/// RFC 8259). The status can't be retracted afterwards, so a late failure ends
+/// the body instead — leaving a complete, well-formed 200 containing only
+/// padding. That's a transport failure, not a malformed answer, and the
+/// difference decides whether the work is retried or dropped.
 ///
-/// When it ends the stream, the client receives a complete, well-formed 200
-/// whose entire body is padding. That is a **transport** failure wearing a
-/// parse error's clothes, and the distinction decides whether the work is
-/// retried or dropped: the identical event cut a moment earlier arrives as
-/// [`ProviderError::Network`] and is retried, while the padded form used to
-/// land as a permanent [`ProviderError::ParseError`].
-///
-/// `serde_json` draws the line for us. [`Category::Eof`] means the input ran
-/// out — a body that is empty, all padding, or cut mid-JSON — and is always a
-/// truncated transfer. `Syntax` and `Data` mean bytes genuinely arrived and
-/// were wrong, which no retry fixes.
+/// `serde_json` draws the line: `Category::Eof` means the input ran out (empty,
+/// all padding, or cut mid-JSON) — always a truncated transfer. `Syntax` and
+/// `Data` mean bytes arrived and were wrong, which no retry fixes.
 pub fn decode_error(
     what: &str,
     body: &str,
@@ -406,12 +386,9 @@ pub fn decode_error(
     ProviderError::Network(format!("truncated {what}: {detail}{trace}"))
 }
 
-/// The streaming counterpart of [`decode_error`]'s truncated-body case: a
-/// committed 200 whose stream closed without ever carrying a payload.
-///
-/// Kept distinct from "the model returned empty content", which is a real
-/// (if unusual) answer. This is the absence of an answer, and like every
-/// other form of a body that never arrived it is transient.
+/// Streaming counterpart of [`decode_error`]: a committed 200 whose stream
+/// closed without carrying a payload. Distinct from "the model returned empty
+/// content", which is a real answer; this is the absence of one.
 pub fn stream_delivered_nothing(what: &str, trace_id: Option<&str>) -> ProviderError {
     let trace = trace_id
         .map(|id| format!(" [generation {id}]"))

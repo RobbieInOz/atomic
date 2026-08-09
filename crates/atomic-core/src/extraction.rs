@@ -2,7 +2,9 @@
 //!
 //! This module handles automatic tag extraction from atom content.
 
-use crate::providers::structured::{call_structured, SchemaEnforcement, StructuredCall};
+use crate::providers::structured::{
+    call_structured, SchemaEnforcement, StructuredCall, GENERATIVE_CALL_ENFORCEMENT,
+};
 use crate::providers::types::{GenerationParams, Message};
 use crate::providers::ProviderConfig;
 use rusqlite::Connection;
@@ -247,42 +249,16 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
     })
 }
 
-/// How the tagging schema reaches the model.
-///
-/// Tag extraction is *generative*: the model decides how many tags to emit, so
-/// a decoder that shortens the output silently changes the answer rather than
-/// just its shape. Wire-level `response_format` does exactly that on
-/// OpenRouter — measured 2026-08-09 on `google/gemma-4-26b-a4b-it` pinned to
-/// DeepInfra, it returned `{"tags": []}` on 3 calls of 6, with counts swinging
-/// 5–13 on identical input. That failure is **silent**: an empty-but-valid
-/// result parses, so no fallback fires, and the atom is recorded tagged with
-/// nothing. Schema in the prompt returned 4–8 tags on 8 of 8.
-///
-/// This started out provider-dependent, on a measurement that said prompt mode
-/// emptied half of `llama3.2`'s extractions. That was wrong twice over: the
-/// model was echoing the *schema* back rather than returning nothing, and it
-/// was doing so because the instruction handed it a JSON Schema document and
-/// asked it to "match this schema" — genuinely ambiguous input for a 3B model.
-/// Once [`crate::providers::structured`] began leading with a concrete example
-/// of the shape, `llama3.2` produced valid output on 8 of 8 first attempts, and
-/// the provider distinction had nothing left to stand on.
-///
-/// So: one transport everywhere. It is required on OpenRouter, free on Ollama,
-/// and its failure mode — a reply the tolerant parser rejects, which re-asks
-/// and retries — is the one we can actually see.
-const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = SchemaEnforcement::PromptOnly;
+/// Extraction and consolidation are generative — see
+/// [`GENERATIVE_CALL_ENFORCEMENT`]. Applies to every provider: an earlier
+/// Ollama-specific exception turned out to rest on a measurement error.
+const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = GENERATIVE_CALL_ENFORCEMENT;
 
-/// Output ceiling for tag extraction.
-///
-/// A tag list is a few hundred tokens, but reasoning models spend completion
-/// tokens thinking before emitting the JSON — a field failure was observed at
-/// 3091 completion tokens for 300 characters of tags — so the cap has to clear
-/// that comfortably. It is deliberately far below
-/// [`DEFAULT_MAX_OUTPUT_TOKENS`]: OpenRouter routes only to endpoints whose
-/// `max_completion_tokens` covers the request, and 32k prunes real endpoints
-/// from the pool (`google/gemma-4-26b-a4b-it` on DeepInfra caps at 16384 and
-/// drops out entirely, taking the request to a 404 when pinned). 8192 keeps
-/// the pool intact with ~2.6x headroom over the worst generation seen.
+/// Output ceiling for tag extraction. Deliberately well below the 32k default:
+/// OpenRouter only routes to endpoints whose `max_completion_tokens` covers the
+/// request, and 32k prunes real ones from the pool. 8192 keeps the pool intact
+/// with ~2.6x headroom over the largest generation observed (3091 tokens, most
+/// of it a reasoning model thinking before it answers).
 const TAGGING_MAX_OUTPUT_TOKENS: u32 = 8192;
 
 /// Build the shared generation params for extraction calls. Temperature 0.1
@@ -726,10 +702,8 @@ pub async fn consolidate_atom_tags(
         "consolidation_result",
         consolidation_schema(),
     )
-    // Left on the default (constrained decoding) deliberately: the empty-list
-    // degradation was measured for tag *extraction*, not for consolidation,
-    // whose prompt and output shape differ. Worth measuring before moving it.
     .with_params(extraction_params(supported_params))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<TagConsolidationResult>(call).await {

@@ -62,37 +62,36 @@ use std::sync::Arc;
 /// nowhere near it.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
-/// How a structured call asks the model for its JSON.
-///
-/// The wire-level options are not strictly better than the prompt-level one.
-/// `response_format` puts the endpoint's constrained-decoding implementation in
-/// the path, and implementations vary in quality: measured against
-/// `google/gemma-4-26b-a4b-it` on OpenRouter (2026-08-09), DeepInfra's
-/// schema-enforced endpoint returned a valid-but-**empty** `{"tags": []}` on
-/// roughly a third of calls — 8 completion tokens, `finish_reason: stop`, no
-/// error signal of any kind — where the same model given the schema in the
-/// prompt returned 7–8 tags on 8 of 8 calls. Constrained decoding took the
-/// shortest grammar-valid path instead of doing the task.
-///
-/// An empty-but-valid result is the worst failure shape available: it parses,
-/// so no fallback fires, and it reaches the caller looking like an answer.
+/// How a structured call asks the model for its JSON. Wire-level is not
+/// strictly better — see [`GENERATIVE_CALL_ENFORCEMENT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaEnforcement {
-    /// Wire-level `response_format` with `strict: true` — constrained decoding,
-    /// and (on OpenRouter) `provider.require_parameters` routing that narrows
-    /// the endpoint pool to those advertising support.
+    /// `response_format` with `strict: true`. On OpenRouter this also sets
+    /// `provider.require_parameters`, narrowing routing to endpoints that
+    /// advertise support.
     Strict,
-    /// Wire-level `response_format` without `strict`. For endpoints that reject
-    /// OpenAI strict mode but still honour the schema.
+    /// `response_format` without `strict`, for endpoints that reject strict
+    /// mode but still honour the schema.
     Lenient,
-    /// No `response_format` at all: the schema goes in the prompt and the reply
-    /// is parsed tolerantly ([`parse_tolerant`]). Trades a decoding guarantee
-    /// for the endpoint's undistorted output. The measured cost of that trade
-    /// was nil — across `openai/gpt-5-nano`, `google/gemma-4-26b-a4b-it`,
-    /// `openai/gpt-5-mini` and `z-ai/glm-5.2`, 24 of 24 prompt-mode replies
-    /// parsed directly, needing neither fence-stripping nor substring rescue.
+    /// No `response_format`: the schema goes in the prompt and the reply is
+    /// parsed tolerantly ([`parse_tolerant`]).
     PromptOnly,
 }
+
+/// Transport for **generative** structured calls: the model decides how much to
+/// emit and an empty result is legal (tag extraction, consolidation, merge,
+/// wiki section ops).
+///
+/// A constrained decoder can take the shortest grammar-valid path and return
+/// the empty list. That parses, fires no fallback, and is indistinguishable
+/// from a considered "nothing to do" — so the work is silently skipped.
+/// Measured against a weak OpenRouter endpoint: 5/6 empty extractions, 2/6
+/// empty merges, 3/6 no-op wiki updates. Prompt-only: 0 across all of them,
+/// with no reply even needing fence-stripping.
+///
+/// Not for closed-shape calls (one enum choice, fixed-arity object) — nothing
+/// there for a decoder to shorten, so constrained decoding is free.
+pub const GENERATIVE_CALL_ENFORCEMENT: SchemaEnforcement = SchemaEnforcement::PromptOnly;
 
 /// A single structured-output LLM call. Construct with [`StructuredCall::new`],
 /// optionally adjust via the `with_*` methods, then pass to [`call_structured`].
@@ -243,21 +242,15 @@ fn early_end_reason(response: &CompletionResponse) -> Option<&str> {
         .or_else(|| response.native_finish_reason.as_deref().filter(|r| is_cut(r)))
 }
 
-/// A concrete illustration of a schema's output shape: the same structure with
-/// every leaf replaced by an angle-bracketed placeholder drawn from the field's
-/// `description`, and enums shown as their alternatives.
+/// The schema's output shape with leaves replaced by `<placeholder>` text from
+/// each field's `description`, enums shown as their alternatives.
 ///
-/// Exists because a JSON Schema is itself a JSON document, and "reply with an
-/// object matching this schema" followed by a schema is genuinely ambiguous to
-/// a small model — measured on `llama3.2`, 4 or 5 replies in 8 came back as the
-/// *schema* with the answer nested under `properties`. Showing the shape
-/// instead removes the ambiguity: 8 of 8 valid, with or without the schema also
-/// present.
-///
-/// Placeholders rather than plausible values on purpose. Invented values get
-/// copied — and for an enum whose first variant is the do-nothing case
-/// (`wiki_update_section_ops`), a "realistic" example would nudge the model
-/// straight at the degenerate answer this module exists to avoid.
+/// A JSON Schema is itself JSON, so "reply with an object matching this schema"
+/// followed by a schema is ambiguous: `llama3.2` returned the *schema*, answer
+/// nested under `properties`, in half of replies. Showing the shape fixes it
+/// (8/8 valid). Placeholders not plausible values — invented values get copied,
+/// and for an enum whose first variant is the do-nothing case (section ops)
+/// that would point straight at the degenerate answer.
 fn example_from_schema(schema: &Value) -> Value {
     let placeholder = |schema: &Value| -> Value {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
@@ -298,13 +291,10 @@ fn example_from_schema(schema: &Value) -> Value {
     }
 }
 
-/// The prompt-level statement of the output contract, used both as the primary
-/// instruction under [`SchemaEnforcement::PromptOnly`] and as the re-ask in the
-/// fallback. One wording, so the two paths cannot drift apart.
-///
-/// Leads with the shape and keeps the schema behind it: the example is what
-/// small models actually follow, and the schema still carries the constraints
-/// an example cannot express (enums, required fields, `additionalProperties`).
+/// The prompt-level output contract — the primary instruction under
+/// [`SchemaEnforcement::PromptOnly`] and the re-ask in the fallback, so the two
+/// cannot drift apart. Shape first (what weak models follow), schema behind it
+/// (constraints an example can't express).
 fn schema_instruction(schema: &Value) -> String {
     let example = serde_json::to_string_pretty(&example_from_schema(schema))
         .unwrap_or_else(|_| "{}".to_string());
@@ -365,16 +355,10 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         ..
     } = call;
 
-    // Guarantee an output cap. `StructuredCall::new` sets one, but
-    // `with_params` replaces the params struct wholesale, so any caller that
-    // builds its own `GenerationParams` silently drops it — tag extraction
-    // did exactly that, and an absent `max_tokens` is the harmful direction:
-    // it hands the ceiling to whatever default the router or upstream picks,
-    // and it changes *routing* (OpenRouter filters endpoints by their
-    // `max_completion_tokens`, so sending nothing widens the pool while
-    // sending 32k can narrow it to none). Callers with a smaller natural
-    // ceiling should set it explicitly; forgetting entirely must not be an
-    // option.
+    // Guarantee an output cap. `with_params` replaces the params struct
+    // wholesale, so a caller building its own `GenerationParams` drops the
+    // default silently — tag extraction did. An absent `max_tokens` hands the
+    // ceiling to the router and changes which endpoints it will route to.
     let params = if params.max_tokens.is_some() {
         params
     } else {
@@ -610,11 +594,8 @@ const LONG_FORM_TRAILER: &str = "CITATIONS_USED:";
 /// section ops) keep [`call_structured`]: their outputs are small and the
 /// JSON envelope costs nothing there.
 ///
-/// Note that "keep `call_structured`" is not the same as "keep constrained
-/// decoding" — see [`SchemaEnforcement`]. Measurement has since shown the
-/// wire-level `response_format` layer degrading *generative* short calls on
-/// some endpoints (tag extraction collapsing to an empty list), so
-/// `call_structured` now carries the choice explicitly.
+/// Note that keeping `call_structured` is not the same as keeping constrained
+/// decoding — see [`GENERATIVE_CALL_ENFORCEMENT`].
 pub async fn call_long_form_markdown(
     provider_config: &ProviderConfig,
     model: &str,

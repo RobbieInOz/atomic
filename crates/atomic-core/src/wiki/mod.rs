@@ -16,7 +16,9 @@ use crate::models::{
     WikiArticleSummary, WikiArticleVersion, WikiArticleWithCitations, WikiCitation, WikiLink,
     WikiVersionSummary,
 };
-use crate::providers::structured::{call_structured, StructuredCall};
+use crate::providers::structured::{
+    call_structured, StructuredCall, GENERATIVE_CALL_ENFORCEMENT,
+};
 use crate::providers::types::Message;
 use crate::providers::ProviderConfig;
 use crate::storage::StorageBackend;
@@ -657,7 +659,10 @@ pub(crate) async fn call_llm_for_wiki_typed<T: DeserializeOwned>(
 
     let messages = vec![Message::system(system_prompt), Message::user(user_content)];
 
-    let call = StructuredCall::<T>::new(provider_config, model, &messages, schema_name, schema);
+    // Section ops are generative and "no operations" is a legal answer, so a
+    // constrained decoder can silently return a no-op update.
+    let call = StructuredCall::<T>::new(provider_config, model, &messages, schema_name, schema)
+        .with_schema_enforcement(GENERATIVE_CALL_ENFORCEMENT);
 
     let started = std::time::Instant::now();
     match call_structured::<T>(call).await {
