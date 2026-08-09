@@ -136,11 +136,21 @@ impl Respond for ChatResponder {
             Err(_) => return ResponseTemplate::new(400),
         };
 
+        let request_text = body.to_string().to_lowercase();
+        // Generative callers keep the schema off the wire (see
+        // `GENERATIVE_CALL_ENFORCEMENT`) and state it in the prompt instead, so
+        // fall back to sniffing it — otherwise extraction silently benchmarks
+        // an empty `{}` response.
         let schema_name = body
             .pointer("/response_format/json_schema/name")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let request_text = body.to_string().to_lowercase();
+            .unwrap_or_else(|| {
+                if request_text.contains("parent_name") {
+                    "extraction_result"
+                } else {
+                    ""
+                }
+            });
 
         let content = match schema_name {
             "extraction_result" => json!({
