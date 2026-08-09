@@ -2,7 +2,7 @@
 //!
 //! This module handles LLM-assisted tag merging and categorization.
 
-use crate::providers::structured::{call_structured, StructuredCall};
+use crate::providers::structured::{call_structured, StructuredCall, GENERATIVE_CALL_ENFORCEMENT};
 use crate::providers::types::{GenerationParams, Message};
 use crate::providers::ProviderConfig;
 use rusqlite::Connection;
@@ -202,6 +202,9 @@ async fn get_merge_suggestions(
         merge_schema(),
     )
     .with_params(params)
+    // `{"merges": []}` is a legal answer, so a constrained decoder can return
+    // it and compaction silently does nothing.
+    .with_schema_enforcement(GENERATIVE_CALL_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<MergeResult>(call).await {

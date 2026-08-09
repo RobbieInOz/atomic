@@ -713,13 +713,30 @@ fn section_ops_system_prompts(ctx: &TestCtx) -> Vec<String> {
     ctx.mock
         .chat_request_bodies()
         .iter()
-        .filter(|body| {
-            body.pointer("/response_format/json_schema/name")
-                .and_then(Value::as_str)
-                == Some("wiki_update_section_ops")
-        })
+        .filter(|body| is_section_ops_call(body))
         .filter_map(system_prompt_of)
         .collect()
+}
+
+/// Section ops keeps the schema off the wire (see `GENERATIVE_CALL_ENFORCEMENT`),
+/// so recognise the call by the schema it states in the prompt — the same
+/// `after_heading` marker the mock routes on. The wire-name check stays for any
+/// caller that still sends `response_format`.
+fn is_section_ops_call(body: &Value) -> bool {
+    if body
+        .pointer("/response_format/json_schema/name")
+        .and_then(Value::as_str)
+        == Some("wiki_update_section_ops")
+    {
+        return true;
+    }
+    body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("after_heading"))
+        })
+    })
 }
 
 fn system_prompt_of(body: &Value) -> Option<String> {

@@ -12,7 +12,42 @@ use crate::providers::traits::{
 use crate::providers::types::{CompletionResponse, Message, ToolDefinition};
 use async_trait::async_trait;
 use reqwest::Client;
+use serde::Deserialize;
 use std::time::Duration;
+
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    error: ErrorEnvelopeDetail,
+}
+
+#[derive(Deserialize)]
+struct ErrorEnvelopeDetail {
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Recover an upstream failure the gateway wrote into a **200** body, as
+/// `(code, message)`. OpenRouter commits its status before the upstream
+/// produces anything, so a later failure can only be an error object or a
+/// truncated body (see `providers::error::decode_error`). Both the chat and
+/// embedding response types require a payload field, so an unrecognised
+/// envelope would otherwise look like a permanent parse failure.
+fn upstream_error(body: &str) -> Option<(String, String)> {
+    let envelope: ErrorEnvelope = serde_json::from_str(body).ok()?;
+    Some((
+        envelope
+            .error
+            .code
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        envelope
+            .error
+            .message
+            .unwrap_or_else(|| "Unknown upstream error".to_string()),
+    ))
+}
 
 /// OpenRouter provider implementation
 /// Supports embeddings, chat completions, streaming, tool calling, and structured outputs

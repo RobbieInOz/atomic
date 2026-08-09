@@ -284,6 +284,8 @@ async fn complete_internal(
 
     let response = req.json(&request).send().await?;
 
+    let trace_id = crate::providers::error::gateway_trace_id(response.headers());
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let retry_after = response
@@ -294,13 +296,13 @@ async fn complete_internal(
         let body = response.text().await.unwrap_or_default();
 
         if status == 429 {
-            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 200), "OpenAI-compat LLM rate limited");
+            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 200), "OpenAI-compat LLM rate limited");
             return Err(ProviderError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
 
-        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenAI-compat LLM API error");
+        tracing::error!(status, model = %config.model, request_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenAI-compat LLM API error");
         return Err(ProviderError::Api {
             status,
             message: body,
@@ -311,8 +313,8 @@ async fn complete_internal(
 
     let chat_response: ChatResponse = serde_json::from_str(&body)
         .map_err(|e| {
-            tracing::error!(error = %e, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenAI-compat LLM parse error");
-            ProviderError::ParseError(format!("Failed to parse chat response: {e}"))
+            tracing::error!(error = %e, model = %config.model, request_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenAI-compat LLM response decode failed");
+            crate::providers::error::decode_error("chat response", &body, &e, trace_id.as_deref())
         })?;
 
     let choice = chat_response
@@ -384,13 +386,13 @@ pub async fn complete_streaming_with_tools(
         let body = response.text().await.unwrap_or_default();
 
         if status == 429 {
-            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 200), "OpenAI-compat streaming LLM rate limited");
+            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 200), "OpenAI-compat streaming LLM rate limited");
             return Err(ProviderError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
 
-        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenAI-compat streaming LLM API error");
+        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenAI-compat streaming LLM API error");
         return Err(ProviderError::Api {
             status,
             message: body,
@@ -402,6 +404,10 @@ pub async fn complete_streaming_with_tools(
     let mut buffer = String::new();
     let mut finish_reason = None;
     let mut done_emitted = false;
+    // See the OpenRouter parser: a stream that carries no payload and no
+    // terminator delivered nothing, which must not be mistaken for a model
+    // that chose to say nothing.
+    let mut saw_payload = false;
 
     let mut stream = response.bytes_stream();
 
@@ -432,6 +438,7 @@ pub async fn complete_streaming_with_tools(
                         tracing::debug!(error = %e, chunk_preview = %crate::providers::error::truncate_utf8(json_str, 200), "OpenAI-compat stream chunk parse error");
                     }
                     Ok(response) => {
+                        saw_payload = true;
                         if let Some(choice) = response.choices.first() {
                             if choice.finish_reason.is_some() {
                                 finish_reason = choice.finish_reason.clone();
@@ -497,6 +504,17 @@ pub async fn complete_streaming_with_tools(
                 }
             }
         }
+    }
+
+    if !saw_payload && !done_emitted {
+        tracing::error!(
+            model = %config.model,
+            "OpenAI-compat stream closed without delivering any payload"
+        );
+        return Err(crate::providers::error::stream_delivered_nothing(
+            "chat stream",
+            None,
+        ));
     }
 
     // Some OpenAI-compatible servers close the stream without sending [DONE]

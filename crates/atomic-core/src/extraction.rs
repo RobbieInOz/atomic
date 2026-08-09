@@ -2,7 +2,9 @@
 //!
 //! This module handles automatic tag extraction from atom content.
 
-use crate::providers::structured::{call_structured, StructuredCall};
+use crate::providers::structured::{
+    call_structured, SchemaEnforcement, StructuredCall, GENERATIVE_CALL_ENFORCEMENT,
+};
 use crate::providers::types::{GenerationParams, Message};
 use crate::providers::ProviderConfig;
 use rusqlite::Connection;
@@ -247,6 +249,18 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
     })
 }
 
+/// Extraction and consolidation are generative — see
+/// [`GENERATIVE_CALL_ENFORCEMENT`]. Applies to every provider: an earlier
+/// Ollama-specific exception turned out to rest on a measurement error.
+const TAGGING_SCHEMA_ENFORCEMENT: SchemaEnforcement = GENERATIVE_CALL_ENFORCEMENT;
+
+/// Output ceiling for tag extraction. Deliberately well below the 32k default:
+/// OpenRouter only routes to endpoints whose `max_completion_tokens` covers the
+/// request, and 32k prunes real ones from the pool. 8192 keeps the pool intact
+/// with ~2.6x headroom over the largest generation observed (3091 tokens, most
+/// of it a reasoning model thinking before it answers).
+const TAGGING_MAX_OUTPUT_TOKENS: u32 = 8192;
+
 /// Build the shared generation params for extraction calls. Temperature 0.1
 /// (tag-picking is nearly deterministic), reasoning minimized, optional
 /// `supported_params` threaded through so we don't send fields the router's
@@ -254,6 +268,7 @@ pub(crate) fn consolidation_schema() -> serde_json::Value {
 fn extraction_params(supported_params: Option<Vec<String>>) -> GenerationParams {
     let mut params = GenerationParams::new()
         .with_temperature(0.1)
+        .with_max_tokens(TAGGING_MAX_OUTPUT_TOKENS)
         .with_minimize_reasoning(true);
     if let Some(supported) = supported_params {
         params = params.with_supported_parameters(supported);
@@ -328,6 +343,7 @@ pub async fn extract_tags_from_content(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -365,6 +381,7 @@ pub async fn extract_tags_from_chunk(
         extraction_schema(),
     )
     .with_params(extraction_params(supported_params))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<ExtractionResult>(call).await {
@@ -686,6 +703,7 @@ pub async fn consolidate_atom_tags(
         consolidation_schema(),
     )
     .with_params(extraction_params(supported_params))
+    .with_schema_enforcement(TAGGING_SCHEMA_ENFORCEMENT)
     .with_max_retries(3);
 
     match call_structured::<TagConsolidationResult>(call).await {
@@ -708,6 +726,19 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db = Database::open_or_create(temp_file.path()).unwrap();
         (db, temp_file)
+    }
+
+    /// Tagging must not put the schema on the wire, on any provider.
+    ///
+    /// The value is what stops the silent failure: a constrained decoder that
+    /// returns `{"tags": []}` produces a result that parses, fires no fallback,
+    /// and marks the atom tagged with nothing. The prompt-level contract fails
+    /// visibly instead, into a parser that re-asks. Reintroducing a
+    /// provider-specific exception here needs a measurement, not an intuition —
+    /// the last one cost three reversals.
+    #[test]
+    fn tagging_never_puts_the_schema_on_the_wire() {
+        assert_eq!(TAGGING_SCHEMA_ENFORCEMENT, SchemaEnforcement::PromptOnly);
     }
 
     // ==================== Schema lint regression tests ====================

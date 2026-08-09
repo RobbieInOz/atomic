@@ -956,9 +956,26 @@ impl Respond for ChatResponder {
             return with_delay(response);
         }
 
+        // Schema-less requests are routed by sniffing the schema the caller
+        // stated in the prompt. Two paths arrive this way: the prompt-based
+        // fallback, and every generative caller, which keeps `response_format`
+        // off the wire entirely (see `GENERATIVE_CALL_ENFORCEMENT`).
+        //
+        // Distinctive property names are the discriminator, so order matters
+        // where schemas overlap — consolidation also carries `parent_name` and
+        // must be tested before extraction claims it. A schema that reaches
+        // the fallback arm here answers `{}`, which surfaces as an unhelpful
+        // "parse failed" far from the cause, so add an arm when adding a
+        // generative call.
         let schema_name = wire_schema.unwrap_or_else(|| {
             if request_text.contains("after_heading") {
                 "wiki_update_section_ops".to_string()
+            } else if request_text.contains("winner_name") {
+                "merge_result".to_string()
+            } else if request_text.contains("tags_to_remove") {
+                "consolidation_result".to_string()
+            } else if request_text.contains("parent_name") {
+                "extraction_result".to_string()
             } else {
                 String::new()
             }

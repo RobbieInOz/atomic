@@ -371,6 +371,12 @@ async fn complete_internal(
         .send()
         .await?;
 
+    // The gateway's id for this request rides in the HEADERS, which arrive
+    // before any body — so it survives exactly the failures where the body
+    // does not. Capture it before anything consumes the response; without it
+    // a call that delivered nothing leaves no thread back to what happened.
+    let trace_id = crate::providers::error::gateway_trace_id(response.headers());
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let retry_after = response
@@ -381,13 +387,13 @@ async fn complete_internal(
         let body = response.text().await.unwrap_or_default();
 
         if status == 429 {
-            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 200), "OpenRouter LLM rate limited");
+            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 200), "OpenRouter LLM rate limited");
             return Err(ProviderError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
 
-        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenRouter LLM API error");
+        tracing::error!(status, model = %config.model, generation_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenRouter LLM API error");
         return Err(ProviderError::Api {
             status,
             message: body,
@@ -395,10 +401,29 @@ async fn complete_internal(
     }
 
     let body = response.text().await?;
+
+    // A 200 carrying an error object instead of a completion — one of the two
+    // exits left to a gateway that already committed its status. `choices` is
+    // required, so without this the envelope would land as a permanent parse
+    // failure. 502 marks it upstream-transient, matching the embedding path.
+    if let Some((code, message)) = super::upstream_error(&body) {
+        tracing::error!(
+            model = %config.model,
+            error_code = %code,
+            error_message = %message,
+            generation_id = trace_id.as_deref().unwrap_or("-"),
+            "OpenRouter returned 200 with error body (upstream provider failure)"
+        );
+        return Err(ProviderError::Api {
+            status: 502,
+            message: format!("[upstream {}] {}", code, message),
+        });
+    }
+
     let chat_response: ChatResponse = serde_json::from_str(&body)
         .map_err(|e| {
-            tracing::error!(error = %e, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenRouter LLM parse error");
-            ProviderError::ParseError(format!("Failed to parse chat response: {e}"))
+            tracing::error!(error = %e, model = %config.model, generation_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenRouter LLM response decode failed");
+            crate::providers::error::decode_error("chat response", &body, &e, trace_id.as_deref())
         })?;
 
     let completion_tokens = chat_response
@@ -504,6 +529,8 @@ async fn complete_streaming_internal(
         .send()
         .await?;
 
+    let trace_id = crate::providers::error::gateway_trace_id(response.headers());
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let retry_after = response
@@ -514,13 +541,13 @@ async fn complete_streaming_internal(
         let body = response.text().await.unwrap_or_default();
 
         if status == 429 {
-            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 200), "OpenRouter streaming LLM rate limited");
+            tracing::warn!(status, retry_after, model = %config.model, body_preview = %crate::providers::error::body_for_log(&body, 200), "OpenRouter streaming LLM rate limited");
             return Err(ProviderError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
 
-        tracing::error!(status, model = %config.model, body_preview = %crate::providers::error::truncate_utf8(&body, 500), "OpenRouter streaming LLM API error");
+        tracing::error!(status, model = %config.model, generation_id = trace_id.as_deref().unwrap_or("-"), body_preview = %crate::providers::error::body_for_log(&body, 500), "OpenRouter streaming LLM API error");
         return Err(ProviderError::Api {
             status,
             message: body,
@@ -536,6 +563,11 @@ async fn complete_streaming_internal(
     let mut upstream_provider = None;
     let mut generation_id = None;
     let mut done_emitted = false;
+    // Did the stream carry a single parseable SSE payload? A committed 200
+    // that then delivers nothing but keepalive padding yields zero of them,
+    // and would otherwise be indistinguishable from a model that legitimately
+    // returned empty content.
+    let mut saw_payload = false;
 
     let mut stream = response.bytes_stream();
 
@@ -570,6 +602,7 @@ async fn complete_streaming_internal(
                         tracing::debug!(error = %e, chunk_preview = %crate::providers::error::truncate_utf8(json_str, 200), "OpenRouter stream chunk parse error");
                     }
                     Ok(response) => {
+                        saw_payload = true;
                         if response.provider.is_some() {
                             upstream_provider = response.provider.clone();
                         }
@@ -641,6 +674,22 @@ async fn complete_streaming_internal(
                 }
             }
         }
+    }
+
+    // No payload and no terminator means the stream delivered nothing. `Ok`
+    // here would look like a model choosing to say nothing, and the caller
+    // would persist that silence. Errors return before `Done` is emitted, as
+    // every earlier bail in this function does.
+    if !saw_payload && !done_emitted {
+        tracing::error!(
+            model = %config.model,
+            generation_id = trace_id.as_deref().unwrap_or("-"),
+            "OpenRouter stream closed without delivering any payload"
+        );
+        return Err(crate::providers::error::stream_delivered_nothing(
+            "chat stream",
+            trace_id.as_deref(),
+        ));
     }
 
     // Some upstreams close the stream without sending [DONE] — mirror the

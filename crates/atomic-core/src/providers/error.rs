@@ -312,3 +312,154 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+/// The gateway's id for a request. Lives in the headers, which arrive before
+/// the body — so it survives the failures where the body doesn't, and resolves
+/// via `GET /api/v1/generation?id=…` to provider, timings, finish reason and
+/// cost. Often the only thread back to a call that delivered nothing.
+pub fn gateway_trace_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-generation-id", "x-request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Render a response body for a log line. Never raw: a padded body (see
+/// [`decode_error`]) prints as an empty field plus a few hundred newlines
+/// dumped into the log, so the diagnostic goes blank exactly when the body is
+/// what you need. Whitespace bodies are described; everything else is escaped.
+pub fn body_for_log(body: &str, max_bytes: usize) -> String {
+    if body.is_empty() {
+        return "<empty body>".to_string();
+    }
+    if body.trim().is_empty() {
+        return format!(
+            "<{} bytes of gateway padding, {} newlines, no payload>",
+            body.len(),
+            body.matches('\n').count()
+        );
+    }
+    format!("{:?}", truncate_utf8(body, max_bytes))
+}
+
+/// Classify a 2xx body that would not deserialize.
+///
+/// OpenRouter commits `200 OK` before the upstream produces anything, then
+/// holds the connection open with JSON whitespace (invisible to a parser, per
+/// RFC 8259). The status can't be retracted afterwards, so a late failure ends
+/// the body instead — leaving a complete, well-formed 200 containing only
+/// padding. That's a transport failure, not a malformed answer, and the
+/// difference decides whether the work is retried or dropped.
+///
+/// `serde_json` draws the line: `Category::Eof` means the input ran out (empty,
+/// all padding, or cut mid-JSON) — always a truncated transfer. `Syntax` and
+/// `Data` mean bytes arrived and were wrong, which no retry fixes.
+pub fn decode_error(
+    what: &str,
+    body: &str,
+    err: &serde_json::Error,
+    trace_id: Option<&str>,
+) -> ProviderError {
+    let trace = trace_id
+        .map(|id| format!(" [generation {id}]"))
+        .unwrap_or_default();
+
+    if err.classify() != serde_json::error::Category::Eof {
+        return ProviderError::ParseError(format!("Failed to parse {what}: {err}{trace}"));
+    }
+
+    let detail = if body.is_empty() {
+        "the gateway committed 200 and sent no body at all".to_string()
+    } else if body.trim().is_empty() {
+        format!(
+            "the gateway committed 200, padded for {} bytes ({} newlines), and ended the \
+             body without ever sending a payload",
+            body.len(),
+            body.matches('\n').count()
+        )
+    } else {
+        format!("the body ended mid-JSON after {} bytes ({err})", body.len())
+    };
+    // Rendered as "Network error: …", which `is_retryable` and
+    // `classify_provider_failure` both already read as transient.
+    ProviderError::Network(format!("truncated {what}: {detail}{trace}"))
+}
+
+/// Streaming counterpart of [`decode_error`]: a committed 200 whose stream
+/// closed without carrying a payload. Distinct from "the model returned empty
+/// content", which is a real answer; this is the absence of one.
+pub fn stream_delivered_nothing(what: &str, trace_id: Option<&str>) -> ProviderError {
+    let trace = trace_id
+        .map(|id| format!(" [generation {id}]"))
+        .unwrap_or_default();
+    ProviderError::Network(format!(
+        "truncated {what}: the gateway committed 200 and closed the stream without \
+         delivering any payload{trace}"
+    ))
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn eof_err(body: &str) -> serde_json::Error {
+        serde_json::from_str::<serde_json::Value>(body).unwrap_err()
+    }
+
+    /// The reported failure: a complete 200 whose body is nothing but
+    /// keepalive padding must be retryable, and must read as `Transient` to a
+    /// scheduler.
+    #[test]
+    fn padded_body_is_a_retryable_transient_failure() {
+        let body = "\n         \n".repeat(116);
+        let err = decode_error("chat response", &body, &eof_err(&body), Some("gen-abc"));
+
+        assert!(matches!(err, ProviderError::Network(_)), "got {err:?}");
+        assert!(err.is_retryable());
+        assert_eq!(
+            classify_provider_failure(&err.to_string()),
+            ProviderFailureClass::Transient
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("232 newlines"), "{rendered}");
+        assert!(rendered.contains("gen-abc"), "{rendered}");
+    }
+
+    /// A body cut mid-JSON is the same transfer failure.
+    #[test]
+    fn truncated_json_is_transient_too() {
+        let body = r#"{"id":"gen-1","choices":["#;
+        let err = decode_error("chat response", body, &eof_err(body), None);
+        assert!(matches!(err, ProviderError::Network(_)), "got {err:?}");
+        assert!(err.is_retryable());
+    }
+
+    /// Bytes that genuinely arrived and were wrong stay a parse error — no
+    /// retry fixes a schema mismatch or malformed JSON.
+    #[test]
+    fn real_parse_failures_stay_permanent() {
+        let syntax = "{not json";
+        let err = decode_error("chat response", syntax, &eof_err(syntax), None);
+        assert!(matches!(err, ProviderError::ParseError(_)), "got {err:?}");
+        assert!(!err.is_retryable());
+
+        // Valid JSON, wrong shape: serde reports Data, not Eof.
+        let data_err = serde_json::from_str::<Vec<u32>>("{\"a\":1}").unwrap_err();
+        let err = decode_error("chat response", "{\"a\":1}", &data_err, None);
+        assert!(matches!(err, ProviderError::ParseError(_)), "got {err:?}");
+    }
+
+    /// A padded body must never be logged raw — that is why the field came
+    /// back blank in the original report.
+    #[test]
+    fn padding_is_described_not_dumped() {
+        let body = "\n         \n".repeat(116);
+        let rendered = body_for_log(&body, 500);
+        assert!(!rendered.contains('\n'), "log line must stay one line");
+        assert!(rendered.contains("232 newlines"), "{rendered}");
+
+        assert_eq!(body_for_log("", 500), "<empty body>");
+        assert_eq!(body_for_log("{\"a\":1}", 500), "\"{\\\"a\\\":1}\"");
+    }
+}
